@@ -29,23 +29,37 @@
 
 ---
 
-### 2. End-to-End Performance Scorecard (Upstream Baseline vs. Optimized Fork)
+### 2. End-to-End Performance Scorecard
 
-Prompt processing (`Prefill`), pure speculative generation (`Decode`), prefix-cached incremental latency (`TTFT`), and suffix-assisted edit generation are reported separately:
+#### 2A. Strict Apples-to-Apples A/B Speedups (Frozen Upstream Baseline vs. Optimized Fork)
 
-| Workload (`Qwen3.8-Flash-Next` `IQ2_XS` + MTP `--spec 4`) | Frozen Upstream (`S0_Baseline`) | Optimized Fork (`Throughput_Max`) | Measured Gain | Verification & Notes |
+Every row below compares the unmodified upstream build (`build-baseline`) against this fork (`build-opt`) under identical prompt/cache conditions:
+
+| Workload (`Qwen3.8-Flash-Next` `IQ2_XS` + MTP `--spec 4`) | Frozen Upstream (`Baseline`) | Optimized Fork (`build-opt`) | Measured A/B Gain | Verification & Notes |
 | :--- | :---: | :---: | :---: | :--- |
 | **Interactive Chat / Code Decode (Median)** | `36.60 tok/s` | **`45.60 tok/s`** | **`+24.6%`** | 3-round counter-balanced confirmation (9 runs) |
 | **Code Generation Decode (Peak)** | `48.80 tok/s` | **`57.00 tok/s`** (`55+` sustained) | **`+16.8%`** | High MTP 4-token acceptance on structured code |
-| **Zero-Skip Exact Mode (`Exact_Max`, `TAIL_SKIP=0`)** | `35.80 tok/s` (`E0`) | **`46.20 tok/s`** (`45.27` mean) | **`+29.1%`** | CLI 128-token greedy **100% bitwise identical** |
-| **4K Context Prompt Prefill (Cold / Warm)** | `308.30 tok/s` | **`426.50` / `455.20 tok/s`** | **`+38.3%` / `+48.2%`** | `463.60 tok/s` (`+50.4%`) with `STRATA_PA_FAST=1` |
-| **4K Context Long Decode (Cold / Warm)** | `35.50 tok/s` | **`40.10` / `43.30 tok/s`** | **`+13.0%` / `+22.0%`** | `Exact_Max` 4K Decode: **`40.40 tok/s`** (`+28.3%` vs `E0`) |
-| **32K Context (`27,773` tok, `int8` KV)** | Prefill `345.7` / Decode `43.9` | **Prefill `523.3` / Decode `47.3 tok/s`** | **Prefill `+51.4%`** | Saves `27.3 s` per 28K prompt; 100% needle hit |
-| **64K Context (`64,412` tok, `k8v4` KV)** | — | **Prefill `519.0` / Decode `43.8 tok/s`** | `124.1 s` for `64.4K` tok | 100% needle hit; `6,707` resident VRAM expert slots |
-| **128K Full Cold Agent Repo (`127,949` tok, `k8v4`)** | — | **Prefill `484.3` / Decode `38.9 tok/s`** | `264.2 s` for `128K` tok | 2/2 needles (`19.1K` & `108.2K`) retrieved verbatim |
-| **256K Extreme Agent Cold (`251,964–255,693` tok)** | — | **Prefill `444.9` / `<think>`+Tool `41.5 tok/s`** | **97.5% of 256K on 16GB** | **3/3 needles (`12.4K / 125.4K / 238.7K`) + JSON Tool Call** |
-| **256K Multi-Turn Prefix-Cached (`255,042` tok)** | — | **TTFT `9.63 s` / Edit+Code `54.8 tok/s`** | **`58.8x` faster Turn-2 TTFT** | `252,163` cached + `2,619` fresh TSan log tokens |
-| **248,320 Full-Vocab FP64 Forward KL Divergence** | `0.009351` | **`0.009299` (`5/5` Top-1 match)** | **Lower KL than baseline** | `Exact_Max` mean KL: **`0.000563`** (vs `E0_Golden_Exact`) |
+| **Zero-Skip Exact Chat (`Exact_Max`, `TAIL_SKIP=0`)** | `35.80 tok/s` (`E0`) | **`46.20 tok/s`** (`45.27` mean) | **`+29.1%`** | CLI 128-token greedy **100% bitwise identical** |
+| **Zero-Skip Exact 4K Decode (`TAIL_SKIP=0`)** | `31.50 tok/s` (`E0`) | **`40.40 tok/s`** (`42.6` peak) | **`+28.3%`** | Pure lossless MoE + CPU/GPU co-scheduling gain |
+| **4K Context Prompt Prefill (Cold / Warm Profile)** | `308.30 tok/s` | **`426.50` / `455.20 tok/s`** | **`+38.3%` (cold)** | Warm reaches `455.2` (`463.6 tok/s` w/ `STRATA_PA_FAST=1`) |
+| **4K Context Long Decode (Cold / Warm Profile)** | `35.50 tok/s` | **`40.10` / `43.30 tok/s`** | **`+13.0%` (cold)** | Warm adaptive cache reaches `43.30 tok/s` |
+| **32K Long-Context Prefill (`27,773` tok, `int8` KV)** | `345.70 tok/s` (`80.4 s`) | **`523.30 tok/s` (`53.1 s`)** | **`+51.4%`** | Saves `27.3 s` per 28K prompt; 100% needle hit |
+| **32K Long-Context Decode (`27,773` tok, `int8` KV)** | `43.90 tok/s` | **`47.30 tok/s`** | **`+7.7%`** | Zero degradation at 28K depth |
+| **248,320 Full-Vocab FP64 Forward KL Divergence** | `0.009351` | **`0.009299` (`5/5` Top-1 match)** | **Lower KL error** | `Exact_Max` mean KL: **`0.000563`** (vs `E0_Golden_Exact`) |
+
+#### 2B. 64K → 256K Extreme Context Scaling & Multi-Turn Agent Stress Test (Single 16GB MI50)
+
+Measured on the optimized fork (`--kv k8v4`) using non-repetitive multi-module C++20 repository snapshots to verify ultra-long Agent capability on a single 16GB HBM2 card (upstream baseline not re-run at 64K–256K):
+
+| Agent Stage & Context Depth | Resident VRAM Experts | Prefill / Incremental TTFT | Decode Speed | Accuracy / Agent Workflow Verification |
+| :--- | :---: | :---: | :---: | :--- |
+| **64K Cold Ingestion (`64,412` tok)** | `6,707` slots (`8.99 GiB`) | **`519.0 tok/s`** (`124.1 s` cold) | **`43.8 tok/s`** (pure MTP) | 100% needle passcode recall |
+| **128K Full Cold Repo (`127,949` tok)** | `5,489` slots (`7.36 GiB`) | **`484.3 tok/s`** (`264.2 s` cold) | **`38.9 tok/s`** (pure MTP) | **2/2** audit keys (`19.1K` & `108.2K`) recalled verbatim |
+| **256K Extreme Cold Turn 1 (`251,964` tok)** | `5,489` slots (`7.36 GiB`) | **`444.9 tok/s`** (`566.4 s` cold) | **`35.6 tok/s`** (pure MTP) | **3/3** keys (`12.4K / 125.4K / 238.7K`) recalled verbatim |
+| **256K Prefix-Cached Turn 2 (`255,042` tok)** | `5,489` slots (`7.36 GiB`) | **TTFT `9.63 s`** (`271.8 tok/s` on `2,619` new tok)* | **`54.8 tok/s`** (Suffix+MTP) | Reuses Strata's native prefix cache (`252,163` tok) + C++20 patch |
+| **256K `<think>` + Tool Call (`255,693` tok)** | `5,489` slots (`7.36 GiB`) | **`444.9 tok/s`** (`574.2 s` cold, 0% thermal drop) | **`41.5 tok/s`** (`<think>`+JSON) | Emits valid `run_patch_verification` call pulling keys across `243K` tok |
+
+<sub>*Note: Turn-2's `9.63 s` incremental response leverages Strata's built-in session prefix cache (also available in upstream) to avoid re-reading the first `252,163` tokens, demonstrating practical multi-turn Agent responsiveness at `255K` depth.</sub>
 
 ---
 
