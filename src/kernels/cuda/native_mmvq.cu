@@ -2394,8 +2394,17 @@ __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w,
 #pragma unroll
         for (int i = 0; i < R; ++i) {
             float v = tmp[j][i];
+            v += __shfl_xor(v, 32, 64);
+            v += __shfl_xor(v, 16, 64);
+#if defined(__gfx906__)
+            v += s26ts::xmov<8>(v);
+            v += s26ts::xmov<4>(v);
+            v += s26ts::xmov<2>(v);
+            v += s26ts::xmov<1>(v);
+#else
 #pragma unroll
-            for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
+            for (int off = 8; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
+#endif
             if (lane == 0 && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = v;
         }
 }
