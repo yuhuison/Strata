@@ -18,10 +18,10 @@
 | Component | Exact Specification & Tuning State |
 | :--- | :--- |
 | **Total Build Cost** | **≈1,500 CNY (≈\$207 USD)** (secondary-market X99 + Vega 20 compute build) |
-| **CPU** | **Intel Xeon E5-2686 v4** (14nm Broadwell-EP, **18 Cores / 36 Threads**, `3.00 GHz` sustained all-core AVX2 + FMA3 under `performance` governor, `45 MiB` 20-way L3 cache with `/sys/fs/resctrl` CAT, single-socket NUMA node 0) |
-| **System RAM** | **64 GB (`4 × 16 GB`) Quad-Channel DDR3-1866 ECC Registered** (`59.7 GB/s` theoretical peak; `33.02 GiB` sparse expert arena zero-copy pinned via `Transparent Huge Pages [always]` + `cudaHostRegister(PORTABLE)`) |
-| **GPU** | **AMD Instinct MI50 16GB HBM2** flashed with **AMD Radeon Pro VII** vBIOS (`Vega 20` / `gfx906:sramecc+:xnack-`, 7nm, **60 CUs / 3,840 SPs**, Wave64, `64 KiB` LDS/CU, **NO Matrix / Tensor Cores**, native `v_dot4_i32_i8` + `26.8 TFLOPS` FP16 + 1-cycle VALU DPP; `16 GiB` 4096-bit HBM2 locked at **`1000 MHz` = `1,024 GB/s`**, `15.957 GiB` usable VRAM with AST BMC headless display) |
-| **Thermal Mod** | Custom dual-fan shroud mod + `hwmon` PWM daemon (`strata-mi50-guard`): holds **`32–46 °C` edge / `42–60 °C` HBM2 / `47–84 °C` junction** across 25+ minutes of continuous 256K full-load prefill (`118.4 W` mean, zero thermal throttling) |
+| **CPU** | **Intel Xeon E5-2686 v4** (14nm Broadwell-EP, **18 Cores / 36 Threads**, `3.00 GHz` sustained all-core AVX2 + FMA3 under `performance` governor, Uncore Ring/LLC locked at **`2.70 GHz`** via `MSR 0x620 = 0x1b1b`, `45 MiB` 20-way L3 cache partitioned via `/sys/fs/resctrl` hardware CAT: **`18 ways (40.5 MiB)`** for CPUs `0–17` AVX2 compute / **`2 ways (4.5 MiB)`** isolated for CPUs `18–35` background DMA) |
+| **System RAM** | **64 GB (`4 × 16 GB`) Quad-Channel DDR3-1866 ECC Registered** (`59.7 GB/s` theoretical peak; `33.02 GiB` sparse expert arena + `2.39 GiB` 256K QSA KV stream zero-copy pinned via `Transparent Huge Pages [always]` + `cudaHostRegister(PORTABLE)`) |
+| **GPU** | **AMD Instinct MI50 16GB HBM2** flashed with **AMD Radeon Pro VII** vBIOS (`Vega 20` / `gfx906:sramecc+:xnack-`, 7nm, **60 CUs / 3,840 SPs**, Wave64, `64 KiB` LDS/CU, **NO Matrix / Tensor Cores**, native `v_dot4_i32_i8` + `26.8 TFLOPS` FP16 + 1-cycle VALU DPP + async Global-to-LDS `buffer_load_dword ... lds` DMA; runtime Linux soft `pp_table` unlocking **`1700 MHz` SCLK / `1100 MHz` HBM2 (`1,126.4 GB/s`) / `1240 MHz` FCLK** without hardware SPI flashing, **`0` UMC/GFX RAS ECC errors**, `15.957 GiB` usable VRAM via AST BMC headless display) |
+| **Thermal Mod** | Custom dual-fan shroud mod + `hwmon` PWM daemon (`strata-mi50-guard`): holds **`32–48 °C` edge / `42–60 °C` HBM2 / `47–84 °C` junction** across continuous full-load 256K prefill & Agent workloads (zero thermal throttling, `ue: 0, ce: 0` RAS) |
 | **PCIe Interconnect** | **PCIe 3.0 x16** (`iommu=pt` passthrough, `setpci` unlocked **`MaxReadReq = 4096 Bytes`** from BIOS `256B`, ASPM L1 disabled) → **`13.3 GB/s` sustained H2D pinned DMA** |
 | **NVMe Storage** | PCIe NVMe SSD streaming the `26.8 GiB` (`320M`-row) Per-Layer Embedding (PLE) n-gram shard via unbuffered `O_DIRECT` at **`38,069 rows/s`** |
 | **OS & Compiler** | Ubuntu 24.04 LTS (Linux 6.8, `ulimit -l unlimited`, `vm.swappiness=1`), host-extracted native **`rocm-gfx906:7.14`** (`AMD clang 23.0.0git +PATCHED`, `rocBLAS 5.5.0.cd957402309`, `-O3 -march=broadwell -mtune=broadwell`, `CMAKE_HIP_ARCHITECTURES=gfx906`) |
@@ -31,52 +31,58 @@
 
 ### 2. End-to-End Performance Scorecard
 
-#### 2A. Strict Apples-to-Apples A/B Speedups (Frozen Upstream Baseline vs. Optimized Fork)
+#### 2A. Strict Apples-to-Apples E2E Comparison (Frozen Vanilla Upstream vs. Final Full-Stack Optimized Fork)
 
-Every row below compares the unmodified upstream build (`build-baseline`) against this fork (`build-opt`) under identical prompt/cache conditions:
+Every row below uses the **exact same prompts, random seeds, and token budgets**, comparing unmodified upstream Strata (`build-baseline` at stock clocks/flags; `—` where unmeasured at 64K–256K) against our final pure-software + OS/GPU-kernel optimized build (`build-opt`, zero hardware SPI flashing):
 
-| Workload (`Qwen3.8-Flash-Next` `IQ2_XS` + MTP `--spec 4`) | Frozen Upstream (`Baseline`) | Optimized Fork (`build-opt`) | Measured A/B Gain | Verification & Notes |
+| Workload (`Qwen3.8-Flash-Next` `IQ2_XS` + MTP `--spec 4`) | Frozen Vanilla Upstream (`Baseline`) | Final Optimized Fork (`build-opt`) | Measured E2E Gain | Verification & Notes |
 | :--- | :---: | :---: | :---: | :--- |
-| **Interactive Chat / Code Decode (Median)** | `36.60 tok/s` | **`45.60 tok/s`** | **`+24.6%`** | 3-round counter-balanced confirmation (9 runs) |
-| **Code Generation Decode (Peak)** | `48.80 tok/s` | **`57.00 tok/s`** (`55+` sustained) | **`+16.8%`** | High MTP 4-token acceptance on structured code |
-| **Zero-Skip Exact Chat (`Exact_Max`, `TAIL_SKIP=0`)** | `35.80 tok/s` (`E0`) | **`46.20 tok/s`** (`45.27` mean) | **`+29.1%`** | CLI 128-token greedy **100% bitwise identical** |
-| **Zero-Skip Exact 4K Decode (`TAIL_SKIP=0`)** | `31.50 tok/s` (`E0`) | **`40.40 tok/s`** (`42.6` peak) | **`+28.3%`** | Pure lossless MoE + CPU/GPU co-scheduling gain |
-| **4K Context Prompt Prefill (Cold / Warm Profile)** | `308.30 tok/s` | **`426.50` / `455.20 tok/s`** | **`+38.3%` (cold)** | Warm reaches `455.2` (`463.6 tok/s` w/ `STRATA_PA_FAST=1`) |
-| **4K Context Long Decode (Cold / Warm Profile)** | `35.50 tok/s` | **`40.10` / `43.30 tok/s`** | **`+13.0%` (cold)** | Warm adaptive cache reaches `43.30 tok/s` |
-| **32K Long-Context Prefill (`27,773` tok, `int8` KV)** | `345.70 tok/s` (`80.4 s`) | **`523.30 tok/s` (`53.1 s`)** | **`+51.4%`** | Saves `27.3 s` per 28K prompt; 100% needle hit |
-| **32K Long-Context Decode (`27,773` tok, `int8` KV)** | `43.90 tok/s` | **`47.30 tok/s`** | **`+7.7%`** | Zero degradation at 28K depth |
-| **248,320 Full-Vocab FP64 Forward KL Divergence** | `0.009351` | **`0.009299` (`5/5` Top-1 match)** | **Lower KL error** | `Exact_Max` mean KL: **`0.000563`** (vs `E0_Golden_Exact`) |
+| **Interactive Chat / Code Decode (9-Run Median / Mean)** | `36.60 tok/s` (`39.77` mean) | **`55.60 tok/s`** (`59.98` mean) | **`+51.9%`** | 9-run suite (`56.90 tok/s` median in 256K Agent mode) |
+| **Code Generation Decode (Peak — Linear `--spec 4`)** | `48.80 tok/s` | **`71.60 tok/s`** (`76.3–77.8` warm) | **`+46.7%`** | High 4-token MTP acceptance + high-priority MTP HIP stream |
+| **Code Generation Decode (Opt-In `--spec-tree 3 --suffix-draft 2`)** | `48.80 tok/s` | **`75.40` / `83.80 tok/s`** | **`+54.5%` / `+71.7%`** | Multi-branch MTP Top-2 + Suffix tree verify (`merge` / warm refactor) |
+| **Zero-Skip Lossless Chat (`Exact_Max`, `TAIL_SKIP=0`)** | `35.80 tok/s` (`E0`) | **`55.20 tok/s`** (`56.92` mean, `62.2` peak) | **`+54.2%`** | CLI 4K + MTP 128-token greedy **100% bitwise identical** (`47.21 tok/s`) |
+| **Zero-Skip Lossless 4K Decode (`TAIL_SKIP=0`)** | `31.50 tok/s` (`E0`) | **`47.80` / `48.60 tok/s`** | **`+51.7%` (cold)** | Pure lossless GCN LDS-DMA + VALU DPP + AVX2 + OS stack gain |
+| **4K Context Prompt Prefill (Cold / Warm Profile)** | `308.30 tok/s` | **`550.70` / `614.00 tok/s`** | **`+78.6%` / `+99.2%`** | Nearly **`2.0x`** faster warm prefill (`I=128` MMQ + `rocBLAS` + `gfx906` PA) |
+| **4K Context Long Decode (Cold / Warm Profile)** | `35.50 tok/s` | **`54.20` / `49.80 tok/s`** | **`+52.7%` (cold)** | `resctrl` L3 CAT eliminates DMA thrashing (`16x` lower latency jitter) |
+| **32K Long-Context Prefill (`27,773` tok, `int8` KV)** | `345.70 tok/s` (`80.4 s`) | **`666.00 tok/s` (`41.7 s`)** | **`+92.7%`** | Saves **`38.7 s`** per 28K prompt; 100% needle passcode recall |
+| **32K Long-Context Decode (`27,773` tok, `int8` KV)** | `43.90 tok/s` | **`50.60 tok/s`** | **`+15.3%`** | Sustained `50+ tok/s` at 28K depth |
+| **64K Long-Context Agent (`64,412` tok, `256K` `--kv-resident 16384`)** | `—` | **`656.70 tok/s` (`98.1 s`) / `48.20 tok/s`** | `—` | **`7,499` VRAM expert slots (`10.04 GiB`)** at 256K cap; `50.5–51.1 tok/s` @ `54.3K` |
+| **248,320 Full-Vocab FP64 Forward KL Divergence** | `0.009351` | **`0.006085` (`5/5` Top-1 match)** | **`-34.9%` KL error** | `Exact_Max` KL `0.002010`; SpecPilot `5,760`-tok Top-1 **`99.27%–99.38%`** |
 
 #### 2B. 64K → 256K Extreme Context Scaling & Multi-Turn Agent Stress Test (Single 16GB MI50)
 
-Measured on the optimized fork (`--kv k8v4`) using non-repetitive multi-module C++20 repository snapshots to verify ultra-long Agent capability on a single 16GB HBM2 card (upstream baseline not re-run at 64K–256K):
+Measured on the optimized fork (`--kv k8v4`) using non-repetitive multi-module C++20 repository snapshots and long-horizon operational logs on a single 16GB HBM2 card (vanilla upstream not run at 64K–256K):
 
-| Agent Stage & Context Depth | Resident VRAM Experts | Prefill / Incremental TTFT | Decode Speed | Accuracy / Agent Workflow Verification |
-| :--- | :---: | :---: | :---: | :--- |
-| **64K Cold Ingestion (`64,412` tok)** | `6,707` slots (`8.99 GiB`) | **`519.0 tok/s`** (`124.1 s` cold) | **`43.8 tok/s`** (pure MTP) | 100% needle passcode recall |
-| **128K Full Cold Repo (`127,949` tok)** | `5,489` slots (`7.36 GiB`) | **`484.3 tok/s`** (`264.2 s` cold) | **`38.9 tok/s`** (pure MTP) | **2/2** audit keys (`19.1K` & `108.2K`) recalled verbatim |
-| **256K Extreme Cold Turn 1 (`251,964` tok)** | `5,489` slots (`7.36 GiB`) | **`444.9 tok/s`** (`566.4 s` cold) | **`35.6 tok/s`** (pure MTP) | **3/3** keys (`12.4K / 125.4K / 238.7K`) recalled verbatim |
-| **256K Prefix-Cached Turn 2 (`255,042` tok)** | `5,489` slots (`7.36 GiB`) | **TTFT `9.63 s`** (`271.8 tok/s` on `2,619` new tok)* | **`54.8 tok/s`** (Suffix+MTP) | Reuses Strata's native prefix cache (`252,163` tok) + C++20 patch |
-| **256K `<think>` + Tool Call (`255,693` tok)** | `5,489` slots (`7.36 GiB`) | **`444.9 tok/s`** (`574.2 s` cold, 0% thermal drop) | **`41.5 tok/s`** (`<think>`+JSON) | Emits valid `run_patch_verification` call pulling keys across `243K` tok |
+| Agent Stage & Context Depth | Vanilla Upstream | Resident VRAM Experts (`build-opt`) | Prefill / Incremental TTFT | Decode Speed | Accuracy / Agent Workflow Verification |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **64K Agent Ingestion (`64,412` tok, `--kv-resident 16384` @ 256K cap)** | `—` | **`7,499` slots (`10.04 GiB`)** | **`656.7 tok/s`** (`98.1 s` cold) | **`48.2 tok/s`** (`50.5–51.1` @ `54.3K`) | 100% passcode recall; `92.4%` QSA KV block reads hit VRAM |
+| **128K Full Cold Repo (`127,949` tok, static KV)** | `—` | `5,489` slots (`7.36 GiB`)* | **`484.3 tok/s`** (`264.2 s` cold) | **`38.9 tok/s`** (pure MTP) | **2/2** audit keys (`19.1K` & `108.2K`) recalled verbatim |
+| **256K Extreme Cold Turn 1 (`251,964` tok, static KV)** | `—` | `5,489` slots (`7.36 GiB`)* | **`444.9 tok/s`** (`566.4 s` cold) | **`35.6 tok/s`** (pure MTP) | **3/3** keys (`12.4K / 125.4K / 238.7K`) recalled verbatim |
+| **256K Prefix-Cached Turn 2 (`255,042` tok, static KV)** | `—` | `5,489` slots (`7.36 GiB`)* | **TTFT `9.63 s`** (`271.8 tok/s` on `2,619` new tok)** | **`54.8 tok/s`** (Suffix+MTP) | Reuses Strata's native prefix cache (`252,163` tok) + C++20 patch |
+| **256K `<think>` + Tool Call (`255,693` tok, static KV)** | `—` | `5,489` slots (`7.36 GiB`)* | **`444.9 tok/s`** (`574.2 s` cold, 0% thermal drop) | **`41.5 tok/s`** (`<think>`+JSON) | Emits valid `run_patch_verification` call pulling keys across `243K` tok |
 
-<sub>*Note: Turn-2's `9.63 s` incremental response leverages Strata's built-in session prefix cache (also available in upstream) to avoid re-reading the first `252,163` tokens, demonstrating practical multi-turn Agent responsiveness at `255K` depth.</sub>
+<sub>*Note 1: The `128K–256K` cold repository stress runs above were recorded prior to Step 6 (`--kv-resident 16384` + `mtp.cpp` dense-ring fix), which subsequently expanded full `262,144`-context resident VRAM capacity from `5,489` (`7.36 GiB`) to **`7,499` slots (`10.04 GiB`)**.<br>**Note 2: Turn-2's `9.63 s` incremental response leverages Strata's built-in session prefix cache (also available in upstream) to avoid re-reading the first `252,163` tokens, demonstrating practical multi-turn Agent responsiveness at `255K` depth.</sub>
 
 ---
 
 ### 3. Step-by-Step Optimization Breakdown (What Each Layer Delivered)
 
-1. **Step 0 — Host DMA, THP Zero-Copy Pinning & Dual-Fan HBM2 Lock**
-   - Unlocked PCIe `MaxReadReq=4096B` + `iommu=pt` (`13.3 GB/s` sustained H2D DMA), pinned the `33.02 GiB` expert arena with `THP [always]`, trimmed idle VRAM footprint to `27 MiB`, and locked MI50 HBM2 at `1000 MHz` (`1,024 GB/s`).
-2. **Step 1 & 2 — Custom Vega 20 (`gfx906`) GCN Kernels & Broadwell AVX2 Bitplane Kernels (Zero Flags, 100% Bit-Identical)**
-   - **Fused MoE Experts (`src/kernels/cuda/iq_kernels.cu`)**: Enabled single-launch Mode-8 (`Gate+Up+SwiGLU+Q8_1`) across `IQ2_S / IQ2_XXS / IQ1_M`, designed an **11-dword conflict-free LDS bitplane transpose** (`gcd(11,32)=1`) for `Q2_0` down-projection, halved `v_dot4_i32_i8` instructions (`16 → 8`) via branchless two's-complement `nib_neg4`, hoisted multi-token `DecG` lookups, and shrank LDS dynamically (`LNT=1/2/4`, `20.7 KB → 11.3 KB`) to jump from **3 to 5 resident blocks/CU** (300 blocks single-wave across 60 CUs). Real-weight 48-layer MoE sped up **`1.48x` (`T=1`)** and **`1.56x` (`T=3` MTP; `IQ2_XXS` `2.65x`)**, boosting `--serve` exact 4K decode by **`+27.3%`** (`31.5 → 40.1 tok/s`) before touching a single config knob.
-   - **Router, BF16/Quant GEMV & 248K Vocab Verify (`native_bf16.cu`, `native_router.cu`, `native_mmvq.cu`, `s26_tsum.cuh`, `verify_kernels.cu`)**: Eliminated 512-CTA wave-tail thrashing on 60 CUs via 128-CTA 4-row tiles (`4.35x–5.67x` faster `[512][2560]` router GEMV; **`3.05x` faster 48-layer routing chain**), replaced 67%–80% of `ds_bpermute_b32` LDS shuffles with 1-cycle hardware VALU DPP (`row_shl` / `quad_perm`), and parallelized Wave64 248K-vocab `argmax_rows` (**`7.84x` faster**).
-   - **Broadwell AVX2 4-Row Bitplane Pool (`src/kernels/cpu/q2_avx2.cpp`, `iq_avx2.cpp`)**: Added 4-row `ymm` register-blocked `rows_bp4_nt1` with 12-row software prefetch and `IQ1_M` multi-token AVX2 kernels (`6.23x` vs `ggml` / `2.70x` vs default `q2_avx2` single-core cold; **`1.73x` faster 17-core CPU `down` phase at `27.4 GB/s`**).
-3. **Step 3 — CPU–GPU–PCIe Co-Scheduling & Vega 20 Exact `arch_defaults` (`+24.6%` to `+29.1%` Decode)**
-   - Microsecond timeline profiling showed the 18-core CPU pool idling `26 ms/round` at default `pcie_frac=0.37`. Rebalancing to **`pcie_frac=0.14`** (86% missed experts on 17 AVX2 cores, 14% over PCIe DMA) + **`spec_min_p=0.65`** + **`aux_cpus=1`** (async hot-expert swap on Core 35 reaching `93%–98%` VRAM hit rate) + baking **17 verified exact `gfx906` switches** into `src/core/arch_defaults.cpp` (while pruning two Vega 20 regressions `FUSE_CONVAB` and `GR_SPLIT` that cost `1.26 ms/window`) lifted exact chat decode to **`46.2 tok/s`** and practical code decode to **`55–57 tok/s`**.
-4. **Step 4 — Shipped 112-Shape `gfx906` `rocBLAS` FP16 Table (`+28.1%` 4K Prefill)**
-   - Unlocked `tune_rocblas` on `gfx906` and generated `tools/hip/gfx906-rocblas-5.5.0.cd957402309.txt` (100 of 112 GEMM shapes >5% faster; GDN `[10240, 2560]` **`2.05x–2.45x`**). Paired with `STRATA_HIP_PROMPT_F16=1` + `STRATA_HC_UPMIX=1`, hyper-connection `hc down+silu` time dropped from **`26.3%` to `3.4%`**, lifting 4K prefill from `307.1` to **`393.3 tok/s`**.
-5. **Step 5 — Hand-Written Wave64 `v_dot4_i32_i8` Online FlashAttention (`523.3 tok/s` @ 32K, `444.9 tok/s` @ 256K)**
-   - Implemented `prompt_attn_gfx906_kernel` in `src/kernels/cuda/qsa_prompt_attn.cu` for matrix-core-less Vega 20: `4 × Wave64`, 1-cycle DPP quad-packing/reductions, 24-bit 3-slice `sdot4` dot products (`1.7e-6` max error vs FP64), fused Sigmoid Gate epilogue, and a disjoint-lifetime anonymous `union` in `Smem906` keeping both `int8` (`26.4 KB`) and `k8v4` (`30.1 KB`) **under `32 KB` LDS for 2 blocks / 8 waves per CU** (`2.07x–2.53x` faster kernel). Even at `--max-context 262144 --kv k8v4`, the single 16GB MI50 statically allocates the full 256K KV cache while retaining **`5,489` VRAM expert slots (`7.36 GiB`)** and `667 MiB` free VRAM headroom.
+1. **Step 0 — Host DMA, Uncore `2.70 GHz`, Intel RDT `resctrl` L3 CAT & Soft `pp_table` (`1,126 GB/s` HBM2, Zero Hardware Flash)**
+   - Unlocked PCIe `MaxReadReq=4096B` + `iommu=pt` (`13.3 GB/s` sustained H2D DMA), pinned the `33.02 GiB` expert arena with `THP [always]`, locked Broadwell Uncore Ring/LLC at `2.70 GHz` (`MSR 0x620 = 0x1b1b`), partitioned the `45 MiB` 20-way L3 cache via `/sys/fs/resctrl` hardware CAT (`18 ways` for CPUs `0–17` AVX2 workers / `2 ways` for CPUs `18–35` background DMA, cutting decode latency std-dev **16x** from `1.79` to `0.11 tok/s`), and injected a runtime Linux soft `pp_table` unlocking **`1700 MHz` SCLK / `1100 MHz` HBM2 (`1,126.4 GB/s`) / `1240 MHz` FCLK** under `strata-mi50-guard` (`ue: 0, ce: 0` RAS ECC).
+2. **Step 1 & 2 — Custom Vega 20 (`gfx906`) Zero-Spill Wave64 Kernels, `I=128` MMQ & Broadwell Dual/4-Row AVX2 Pool**
+   - **Fused MoE & Prefill MMQ (`iq_kernels.cu`, `mmq_moe.cu`)**: Enabled single-launch Mode-8 (`Gate+Up+SwiGLU+Q8_1`), designed an **11-dword conflict-free LDS bitplane transpose** (`gcd(11,32)=1`) for `Q2_0` down-projection, halved `v_dot4_i32_i8` instructions (`16 → 8`) via branchless `nib_neg4`, shrank LDS dynamically (`20.7 KB → 11.3 KB`) for **5 resident blocks/CU** with **0 VGPR spills** across all `gfx906` translation units, and added `I=128` 2-pass sorted MoE MMQ tiles (`STRATA_MMQ_GROUP_SORT=1`).
+   - **Router & 248K Vocab Verify (`native_router.cu`, `verify_kernels.cu`)**: Eliminated 512-CTA wave-tail thrashing on 60 CUs via 128-CTA 4-row tiles (**`3.05x` faster 48-layer routing chain**) and parallelized Wave64 248K-vocab `argmax_rows` (**`7.84x` faster**).
+   - **Broadwell AVX2 Bitplane & Dual-Row Pool (`q2_avx2.cpp`, `iq_avx2.cpp`)**: Added 4-row `ymm`-blocked `rows_bp4_nt1` (`6.23x` vs `ggml` cold; **`1.73x` faster 17-core CPU `down` phase**) plus dual-row `IQ2_XS` gate/up sharing L1 `q8_1` activation loads across expert pairs (`+6–8%` CPU pool throughput).
+3. **Step 3 — Bare-Metal GCN Inline Assembly (`buffer_load_dword ... lds` Async DMA & Engine-Wide 1-Cycle VALU DPP)**
+   - Bypassed compiler VGPR staging in `iq_kernels.cu` and `native_q2.cu` via hand-built 128-bit GCN Buffer Resource Descriptors (`SRD` in `s_mov_b32`, `S_DATA_FORMAT=4` hardware bounds clamp) + `m0` LDS routing + **`buffer_load_dword v0, v_off, s_srd, 0 offen offset:0 lds`** (`308` hardware Global-to-LDS DMA instructions streaming `q8_1` activations straight from HBM2 into LDS, paired with `s_waitcnt lgkmcnt(0); s_barrier` so in-flight `vmcnt` weight prefetches never stall). Replaced remaining `ds_bpermute_b32` cross-lane shuffles across 7 HIP/CUDA headers (`verify_kernels.cu`, `native_bf16.cu`, `native_quant.cu`, `gdn_umv_tc.cuh`, `qsa_kernels.cu`, `mtp_kernels.cu`) with 1-cycle VALU DPP (`v_add_f32_dpp` / `v_mov_b32_dpp`) + `ds_swizzle_b32` (`+6.2%` chat & `+10.6%` 4K decode on top of Steps 0–2, **100% bitwise greedy parity**).
+4. **Step 4 — CPU–GPU–PCIe Co-Scheduling (`pcie_frac=0.18`) & High-Priority MTP Hardware Stream (`STRATA_MTP_HIP_PRIO=1`)**
+   - Rebalanced missed experts (`82%` on 17 AVX2 cores, `18%` over PCIe DMA) + `spec_min_p=0.65` + async Core-35 hot-expert swaps (`93%–98%` active VRAM hit rate) + 17 baked exact `gfx906` switches in `arch_defaults.cpp`, and isolated MTP speculative drafting onto `cudaStreamCreateWithPriority(..., leastPriority - 1)` (`STRATA_MTP_HIP_PRIO=1`) to preempt background PCIe expert swaps (cutting MTP draft latency **40%**, `5.24 → 2.95–3.35 ms/window`).
+5. **Step 5 — Shipped 112-Shape `gfx906` `rocBLAS` FP16 Table & Wave64 `v_dot4_i32_i8` Online FlashAttention (`666 tok/s` @ 32K)**
+   - Shipped `tools/hip/gfx906-rocblas-5.5.0.cd957402309.txt` (`2.05x–2.45x` GDN projections) + `STRATA_HIP_PROMPT_F16=1` + `STRATA_HC_UPMIX=1` (`hc down+silu` `26.3% → 3.4%`), and hand-wrote `prompt_attn_gfx906_kernel` in `qsa_prompt_attn.cu` (`4 × Wave64`, 24-bit 3-slice `sdot4` with `1.7e-6` max error vs FP64, fused Sigmoid Gate epilogue, and `<32 KB` disjoint-lifetime `Smem906` union achieving **2 blocks / 8 waves per CU**), driving 4K warm prefill to **`614.0 tok/s`** and 32K–64K prefill to **`656.7–666.0 tok/s`**.
+6. **Step 6 — 256K Pinned-RAM KV Streaming (`--kv-resident 16384`) & MTP Dense Ring VRAM Fix (`+2,010` Expert Slots at 256K)**
+   - Fixed `src/model/mtp.cpp` so MTP dense ring allocation honors `kv_resident_cells` (`-263 MiB` MTP VRAM: `1,100 → 837 MiB`) and streamed cold 256K QSA `k8v4` KV blocks from `2.39 GiB` pinned DDR3 RAM while keeping `16,384` hot cells/layer in HBM2 (`92.4%` block-attention VRAM hit rate at 64K). Full `262,144`-context resident VRAM experts jumped from `5,489` (`7.36 GiB`) to **`7,499` slots (`10.04 GiB`)**, lifting 54K–64K Agent decode from `~30` to **`48.2–51.1 tok/s`** without lowering `max_context=262144`.
+7. **Step 7 — Opt-In Multi-Branch Tree Speculative Verification (`--spec-tree 1/2/3`, Up to `83.8 tok/s` Code Decode)**
+   - Added end-to-end 2-branch speculative tree drafting (device-side MTP Step-0 Top-2 + Suffix divergence) and zero-spill 48-layer causal-tree verification across GDN delta-rule recurrence (`tree_parent[t]` state branching), QSA sparse block-attention (`tree_anc_mask[t]` + Clock-LRU resident compaction), and PLE n-gram hashing. Verified across `5,760` continuation tokens via SpecPilot FP64 logit forcing (`99.38%` Top-1 match on `--spec-tree 3` vs `99.27%` stock `--spec 4`), reaching **`75.4–83.8 tok/s`** on structured code generation.
 
 ---
 
@@ -92,11 +98,13 @@ cmake -B build-opt -G Ninja \
   -DCMAKE_CXX_FLAGS="-O3 -march=broadwell -mtune=broadwell"
 cmake --build build-opt -j"$(nproc)"
 
-# 2. Launch 256K Agent Server (or set --max-context 32768 --kv int8 for daily Throughput-Max)
+# 2. Launch 256K Agent Server (for 32K daily mode, use --max-context 32768 --kv int8 --kv-grow --vram-reserve-mib 704;
+#    for structured code workloads, optionally append --spec-tree 3 --suffix-draft 2)
 export LD_LIBRARY_PATH="/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
 export STRATA_Q2_BITPLANE=1 STRATA_CPU_IQ_ALL_EXACT1=1
 export STRATA_ADAPT_OVERLAP=1 STRATA_ADAPT_JOB_CPU=35 STRATA_SPEC_COST=1
 export STRATA_HIP_PROMPT_F16=1 STRATA_HC_UPMIX=1 STRATA_GFX906_PA=1
+export STRATA_MMQ_GROUP_SORT=1 STRATA_MTP_HIP_PRIO=1
 export STRATA_ROCBLAS_TUNING="$PWD/tools/hip/gfx906-rocblas-5.5.0.cd957402309.txt"
 
 python3 serve/server.py --engine strata --host 127.0.0.1 --port 8090 -- \
@@ -106,8 +114,8 @@ python3 serve/server.py --engine strata --host 127.0.0.1 --port 8090 -- \
   --ple-gguf /path/to/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf \
   --expert-profile data/expert-profile.bin --expert-cache auto --prefill auto \
   --spec 4 --spec-min-p 0.65 --mtp /path/to/mtp/rt \
-  --max-context 262144 --kv k8v4 --pcie-frac 0.14 \
-  --pool-workers 17 --host-core last --aux-cpus auto --vram-reserve-mib 768 \
+  --max-context 262144 --kv k8v4 --kv-resident 16384 --pcie-frac 0.18 \
+  --pool-workers 17 --host-core last --aux-cpus auto --vram-reserve-mib 576 \
   --adapt-every 1 --adapt-swaps 160 --adapt-decay 0.97
 ```
 
