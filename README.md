@@ -21,7 +21,7 @@
 | **CPU** | **Intel Xeon E5-2686 v4** (14nm Broadwell-EP, **18 Cores / 36 Threads**, `3.00 GHz` all-core `AVX2` + `FMA3`; Uncore ring bus locked at **`2.70 GHz`**; `45 MiB` 20-way L3 cache partitioned via Linux `resctrl`: **`40.5 MiB` (18 ways)** dedicated to CPU compute threads, **`4.5 MiB` (2 ways)** isolating background PCIe transfer threads) |
 | **System RAM** | **64 GB (`4 × 16 GB`) Quad-Channel DDR3-1866 ECC REG** (`59.7 GB/s` peak; 2 MiB Transparent Huge Pages `THP [always]` zero-copy pinning **`33.02 GiB`** of sparse expert weights and **`2.39 GiB`** of 256K streaming KV cache) |
 | **GPU** | **AMD Instinct MI50 16GB HBM2** (Radeon Pro VII firmware, `Vega 20` / `gfx906`, 7nm, **60 CUs / 3,840 SPs**, **no Tensor / Matrix Cores**, native `INT8` dot-product, `26.8 TFLOPS` FP16, 1-cycle cross-lane DPP; running at **`1700 MHz` core / `1100 MHz` HBM2 (`1,126 GB/s`)** via a Linux runtime PowerPlay table without physical VBIOS flashing; **0 ECC errors**, **`15.96 GiB`** usable VRAM) |
-| **Cooling** | Dual-fan shroud mod + automatic fan daemon: holds **`32–48 °C` edge / `42–60 °C` HBM2 / `47–84 °C` junction** under sustained full-load prefill with zero thermal throttling |
+| **Cooling** | Dual-fan shroud mod + automatic fan daemon: holds **`32–53 °C` edge / `42–60 °C` HBM2 / `47–87 °C` junction** under sustained full-load prefill with zero thermal throttling |
 | **PCIe Link** | **PCIe 3.0 x16** (`iommu=pt`, motherboard `MaxReadReq` unlocked from `256B` to **`4096 Bytes`**, ASPM disabled → **`13.3 GB/s` sustained host-to-device DMA**) |
 | **NVMe Storage** | PCIe NVMe SSD streaming the `26.8 GiB` per-layer embedding shard via `O_DIRECT` at **`38,069 rows/s`** |
 | **Software Stack** | Ubuntu 24.04 LTS (Linux 6.8), native **`rocm-gfx906:7.14`** (`rocBLAS 5.5.0`, `-O3 -march=broadwell`) |
@@ -52,15 +52,15 @@ Measured on the same workstation across identical prompts and output lengths:
 
 #### 2B. 64K → 256K Ultra-Long Context & Multi-Turn Agent Stress Test (Single 16GB MI50)
 
-Tested on a single 16GB MI50 using multi-module C++20 codebases (note: the 64K row uses the final streaming-KV build; the 128K–256K rows were recorded on an earlier static-KV build; `—` indicates not run on upstream):
+Tested on a single 16GB MI50 with full `262,144` max context enabled across non-repetitive multi-module C++20 codebases (`—` indicates not run on upstream):
 
 | Workload & Active Context Depth | Upstream Strata | Resident VRAM Experts | Prefill / Incremental TTFT | Decode Speed | Accuracy & Agent Task Verification |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **64K Document Analysis (`64,452` tok, Streaming-KV Final)** | `~331.7` / `~33.3 tok/s` | **`7,499` (`10.04 GiB`)** | **`655.7 tok/s`** (`98.3 s` cold) | **`54.6 tok/s`** | 100% passcode recall; `92.4%` of sparse attention reads hit VRAM |
-| **128K Full Codebase Cold Load (`127,949` tok)** | `—` | `5,489` (`7.36 GiB`) | **`484.3 tok/s`** (`264.2 s` cold) | **`38.9 tok/s`** | Recalls both audit keys at `19K` and `108K` verbatim |
-| **256K Extreme Cold Load Turn 1 (`251,964` tok)** | `—` | `5,489` (`7.36 GiB`) | **`444.9 tok/s`** (`566.4 s` cold) | **`35.6 tok/s`** | Recalls all 3 keys across `12K / 125K / 239K` verbatim |
-| **256K Multi-Turn Follow-Up Turn 2 (`255,042` tok)** | `—` | `5,489` (`7.36 GiB`) | **TTFT `9.63 s`** (`2,619` new tok) | **`54.8 tok/s`** | Reuses session prefix cache (`252K` tokens) and writes a C++20 patch |
-| **256K Reasoning + Tool Call (`255,693` tok)** | `—` | `5,489` (`7.36 GiB`) | **`444.9 tok/s`** (0 thermal drop) | **`41.5 tok/s`** | Extracts keys `243K` tokens apart into a valid JSON tool call |
+| **64K Document Analysis (`64,452` tok)** | `~331.7` / `~33.3 tok/s` | **`7,499` (`10.04 GiB`)** | **`655.7 tok/s`** (`98.3 s` cold) | **`54.6 tok/s`** | 100% passcode recall; `92.4%` of sparse attention reads hit VRAM |
+| **128K Full Codebase Cold Load (`127,949` tok)** | `—` | **`7,499` (`10.04 GiB`)** | **`646.4 tok/s`** (`198.0 s` cold) | **`56.2 tok/s`** | Recalls both audit keys at `19K` and `108K` verbatim |
+| **256K Extreme Cold Load Turn 1 (`251,964` tok)** | `—` | **`7,499` (`10.04 GiB`)** | **`614.5 tok/s`** (`410.0 s` cold) | **`51.8 tok/s`** | Recalls all 3 keys across `12K / 125K / 239K` verbatim; `90.5%` attention VRAM hit |
+| **256K Multi-Turn Follow-Up Turn 2 (`255,037` tok)** | `—` | **`7,499` (`10.04 GiB`)** | **TTFT `6.80 s`** (`2,618` new tok, `384.8 tok/s`) | **`55.3 tok/s`** | Reuses `252K` session prefix cache and writes a lock-free C++20 patch; `93.6%` attention VRAM hit |
+| **256K Reasoning + Tool Call Turn 3 (`255,653` tok)** | `—` | **`7,499` (`10.04 GiB`)** | **`614.3 tok/s`** (`415.8 s` cold) | **`55.9 tok/s`** | Extracts keys `243K` tokens apart into a valid JSON tool call; `94.9%` attention VRAM hit |
 
 ---
 
@@ -75,9 +75,9 @@ Tested on a single 16GB MI50 using multi-module C++20 codebases (note: the 64K r
 4. **CPU–GPU–PCIe Load Balancing & High-Priority Speculative Stream**
    - Tuned heterogeneous dispatch so 17 CPU cores compute 82% of non-VRAM experts while 18% stream over PCIe DMA, paired with background hot-expert promotion (`93%–98%` active VRAM hit rate). Isolating the MTP speculative drafter onto a high-priority GPU hardware stream prevented queuing behind background weight transfers, cutting draft latency by **40%**.
 5. **112-Shape `rocBLAS` Tuning Table & Custom `<32 KB` FlashAttention (Nearly 2x Faster Prefill)**
-   - Benchmarked and shipped optimal Vega 20 `rocBLAS` FP16 kernels across all 112 model matrix shapes, and wrote a custom `INT8` dot-product online FlashAttention kernel fitting strictly under `32 KB` shared memory (doubling GPU occupancy per compute unit) — pushing 32K–64K prompt prefill to **`655–685 tok/s`**.
-6. **256K Pinned-RAM Streaming KV Cache (Eliminating VRAM Expert Squeeze)**
-   - Fixed an excess `263 MiB` VRAM allocation in the speculative draft ring and placed cold 256K KV blocks in `2.39 GiB` of pinned system RAM while keeping the hottest `16K` window per layer in HBM2 (`92.4%` of sparse attention reads at 64K still hit VRAM directly). Even with `max_context=262144`, resident VRAM experts jump from `5,489` back to **`7,499` (`10.04 GiB`)**, preserving full **`54.6–56.9 tok/s`** generation speed.
+   - Benchmarked and shipped optimal Vega 20 `rocBLAS` FP16 kernels across all 112 model matrix shapes, and wrote a custom `INT8` dot-product online FlashAttention kernel fitting strictly under `32 KB` shared memory (doubling GPU occupancy per compute unit) — sustaining **`614–685 tok/s`** prompt prefill across 32K–256K context depths.
+6. **256K Pinned-RAM Streaming KV Cache (Near-Zero Decode Drop from 32K to 256K)**
+   - Fixed an excess `263 MiB` VRAM allocation in the speculative draft ring and placed cold 256K KV blocks in `2.39 GiB` of pinned system RAM while keeping the hottest `16K` window per layer in HBM2 (even at `255K` depth, **`90.5%–94.9%`** of sparse attention reads hit VRAM directly). With `max_context=262144` enabled, resident VRAM experts jump from `5,489` back to **`7,499` (`10.04 GiB`)**, keeping decode speed at **`51.8–56.2 tok/s`** all the way from 32K to 256K.
 7. **Multi-Branch Tree Speculative Decoding (Up to `83.8 tok/s` on Code)**
    - Added optional causal-tree speculative verification (`--spec-tree 1/2/3`): when draft confidence splits, the engine verifies two candidate token branches in a single forward pass across both recurrent and attention layers, reaching **`75.4–83.8 tok/s`** on code generation and refactoring.
 
