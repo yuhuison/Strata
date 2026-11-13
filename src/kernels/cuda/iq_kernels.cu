@@ -2589,7 +2589,9 @@ __device__ __forceinline__ void ed_gu_rows(const uint8_t* const* wr, const int4*
 // gate/up: 16 sub-warps of 16 lanes, R rows each = 16 R rows per pass, `rb` rows per block (a multiple of 16 R; 2 n_ff
 // is one too, so a pass is whole or absent for the entire block).  Group stride as native_gu_multi_kernel.
 template<int TG, int R, int MINB>
-#if defined(__HIPCC__)
+#if defined(__gfx906__)
+__global__ void __launch_bounds__(256, (R >= 2 ? 1 : 2)) expdec_gu_kernel(
+#elif defined(__HIPCC__)
 __global__ void __launch_bounds__(256, MINB * 2) expdec_gu_kernel(
 #else
 __global__ void __launch_bounds__(256, MINB) expdec_gu_kernel(
@@ -2779,7 +2781,11 @@ __device__ __forceinline__ void ed_d42_rows(const uint8_t* const* wr, const int4
 // down (IQ4_NL: 32 sub-warps of 8 lanes; Q2_0: 16 of 16), R rows per lane, `rb` rows per block (a multiple of the
 // rows per pass; n_embd too).  The entries' h rows are contiguous in hq (entry e at e * ED_HB).
 template<int TD, int R>
+#if defined(__gfx906__)
+__global__ void __launch_bounds__(256, (R >= 4 ? 1 : 2)) expdec_down_kernel(const unsigned long long* __restrict__ grp_ptr,
+#else
 __global__ void __launch_bounds__(256, STRATA_EXPDEC_MINB) expdec_down_kernel(const unsigned long long* __restrict__ grp_ptr,
+#endif
                                                                               const int32_t* __restrict__ grp_start,
                                                                               const int32_t* __restrict__ n_groups,
                                                                               const int32_t* __restrict__ ent_dst,
@@ -6012,16 +6018,15 @@ template<> struct DecG<22> {
 };
 template<> struct DecG<17> {
     int ws[8];
-    int ls0, ls1;
-    float dw;
+    uint32_t sd;
     __device__ static __forceinline__ DecG load(const void* vbq, int kbx, int iqs, const uint64_t* grid) {
         const block_iq2_xs* bq2 = (const block_iq2_xs*) vbq + kbx;
         const int2 q2_packed = make_int2(get_int_b2(bq2->qs, iqs + 0), get_int_b2(bq2->qs, iqs + 1));
         const uint16_t* q2 = (const uint16_t*) &q2_packed;
+        uint16_t d16;
+        memcpy(&d16, &bq2->d, sizeof(d16));
         DecG r;
-        r.ls0 = bq2->scales[iqs / 2] & 0x0F;
-        r.ls1 = bq2->scales[iqs / 2] >> 4;
-        r.dw = __half2float(bq2->d);
+        r.sd = (uint32_t) bq2->scales[iqs / 2] | ((uint32_t) d16 << 16);
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
             const uint2 grid_pos = *(const uint2*) (grid + (q2[c] & 0x1FF));
@@ -6038,8 +6043,12 @@ template<> struct DecG<17> {
         for (int l0 = 0; l0 < 4; ++l0) sumi0 = ggml_cuda_dp4a(ws[l0], get_int_b4(b.qs, l0), sumi0);
 #pragma unroll
         for (int l0 = 4; l0 < 8; ++l0) sumi1 = ggml_cuda_dp4a(ws[l0], get_int_b4(b.qs, l0), sumi1);
+        const int ls0 = (int) (sd & 0x0Fu), ls1 = (int) ((sd >> 4) & 0x0Fu);
         const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
-        const float d = dw * __low2float(b.ds);
+        const uint16_t d16 = (uint16_t) (sd >> 16);
+        half dh;
+        memcpy(&dh, &d16, sizeof(dh));
+        const float d = __half2float(dh) * __low2float(b.ds);
         return d * sumi;
     }
 };

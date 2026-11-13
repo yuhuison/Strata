@@ -1241,7 +1241,14 @@ static bool s26_tsum_on() {
 // S26 STRATA_LFUSE (PAIR): blocks n_out.. compute the same rows of w2 into y2 (two matrices of one shape on one
 // input in one launch; each output's code is the single matrix's)
 template<typename F, int NCOLS, int NW, int ROWS, bool TS = false, bool PAIR = false>
+#if defined(__HIPCC__)
+// On Wave64 HIP, __launch_bounds__(maxThreads, minBlocks) maps minBlocks directly to amdgpu_waves_per_eu:
+// NW*WARP=128 (2 Wave64 waves/CTA) with minBlocks=4 forced 16 waves/CU (64 VGPRs) and spilled up to 18 VGPRs;
+// minBlocks=2 matches CUDA's 512 threads/SM (8 waves/CU = 128 VGPRs, zero scratch spills).
+__launch_bounds__(NW * WARP, (ROWS <= 2 ? (NW * WARP >= 256 ? 4 : 2) : 1))
+#else
 __launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))
+#endif
 __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w, const Q81Block* x_, float* y_,
                                          int n_in, int n_out,
                                          const typename F::Block* __restrict__ w2 = nullptr, float* __restrict__ y2 = nullptr) {

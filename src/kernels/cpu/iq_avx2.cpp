@@ -221,9 +221,8 @@ template <> struct Fmt32<17> {   // IQ2_XS: d, qs[32] u16 (9-bit grid index + 7-
         const int o = 4 * half;
         g = _mm256_set_epi64x((long long) iq2xs_grid[v[o + 3] & 511], (long long) iq2xs_grid[v[o + 2] & 511],
                               (long long) iq2xs_grid[v[o + 1] & 511], (long long) iq2xs_grid[v[o] & 511]);
-        uint32_t s = 0;
-        for (int l = 0; l < 4; ++l) s |= (uint32_t) ksigns_iq2xs[v[o + l] >> 9] << (8 * l);
-        sgn = sgn_vec(s);
+        sgn = _mm256_set_epi64x((long long) even_signs.v[v[o + 3] >> 9], (long long) even_signs.v[v[o + 2] >> 9],
+                                (long long) even_signs.v[v[o + 1] >> 9], (long long) even_signs.v[v[o] >> 9]);
         const uint8_t sb = b[66 + 2 * j + half];
         sc = scale_vec(scale_vecs.s16[sb]);
     }

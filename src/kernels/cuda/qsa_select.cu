@@ -1232,7 +1232,9 @@ int scores_thread_arch() {
         cudaDeviceProp properties{};
         arch = 0;
         if (cudaGetDeviceProperties(&properties, device) == cudaSuccess)
-            arch = gfx_arch_is_gfx12(properties.gcnArchName) ? 2 : gfx_arch_is(properties.gcnArchName, "gfx1100") ? 1 : 0;
+            arch = gfx_arch_is_gfx12(properties.gcnArchName) ? 2
+                 : gfx_arch_is_gfx906(properties.gcnArchName) ? 3
+                 : gfx_arch_is(properties.gcnArchName, "gfx1100") ? 1 : 0;
         cached_device = device;
         cudaGetLastError();
     }
@@ -2127,14 +2129,18 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     }
     const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
 #if defined(__HIPCC__)
-    // STRATA_SCORES_THREAD: 1 = on (gfx1100, gfx12), 0 = off, unset = on for gfx12 only (gfx1100: off, nothing measured here)
+    // STRATA_SCORES_THREAD: 1 = on (gfx906, gfx1100, gfx12), 0 = off, unset = on for gfx12 (>=16385 blocks) and gfx906 (>=512 blocks)
     static const int thread_env = [] {
         const char* value = std::getenv("STRATA_SCORES_THREAD");
         return value == nullptr ? -1 : (std::atoi(value) == 1 ? 1 : 0);
     }();
     // The bound is the ACTUAL live extent. A reserved 256K context never enables this by itself.
-    if (thread_env != 0 && active_blocks >= 16385 && active_blocks <= max_blocks && nq >= 64 &&
-        (scores_thread_arch() == 2 || (thread_env == 1 && scores_thread_arch() == 1))) {
+    const int st_arch = scores_thread_arch();
+    const bool use_scores_thread =
+        thread_env != 0 && active_blocks <= max_blocks && nq >= 64 &&
+        ((st_arch == 3 && active_blocks >= (thread_env == 1 ? 64 : (nq >= 512 ? 1024 : 4096))) ||
+         (active_blocks >= 16385 && (st_arch == 2 || (thread_env == 1 && st_arch == 1))));
+    if (use_scores_thread) {
         static thread_local bool logged = false;
         if (!logged && (thread_env == -1 || std::getenv("STRATA_SCORES_THREAD_TRACE"))) {
             std::fprintf(stderr, "qsa exact thread: the prompt's block scorer runs as the four-lanes-per-query kernel (nq=%lld active_blocks=%lld "
@@ -2951,14 +2957,21 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
 #if defined(__HIPCC__)
     // gfx1201: below ~28K cells (7,168 blocks) the 1,024-thread kernel's fixed cost loses to the ref.  STRATA_TOPK_REG_MIN_BLOCKS
     // moves the line (0: the register kernel always); gfx1151's table sets 4096, the crossover with the cooperative scan
+    static const bool kHasRegMinEnv = std::getenv("STRATA_TOPK_REG_MIN_BLOCKS") != nullptr;
     static const int64_t kRegMinBlocks = [] {
         const char* v = std::getenv("STRATA_TOPK_REG_MIN_BLOCKS");
         return v != nullptr ? (int64_t) std::atoll(v) : (int64_t) 7168;
     }();
+    // gfx906 (Wave64): in prefill (counted=true, hundreds of concurrent CTAs across 60 CUs), block_topk_reg_kernel<33/66>'s
+    // 432B / 1,120B per-lane scratch overflows the 4 MB L2 cache to HBM2 (1.40 ms vs 0.86 ms on wide at 64K); route counted
+    // prefill >=7168 blocks to block_topk_wide_kernel<false> (39 VGPRs, 0B scratch), while keeping L1-resident reg<33> for
+    // 1..8-query decode (!counted, 0.024 ms vs 0.048 ms at 4K).
+    const bool gfx906_no_reg = !kHasRegMinEnv && scores_thread_arch() == 3 && counted;
     const bool too_small = counted && reach < kRegMinBlocks;
     // campaign3: `reach > fit` no longer forces the ref radix - the wide kernel below takes it (same ids).
     if (old || too_small) {
 #else
+    constexpr bool gfx906_no_reg = false;
     constexpr int64_t kWideMinBlocks = 4608;   // RTX 3060: a prompt batch below ~18K cells is faster on the ref
     const bool too_small = reach > fit && active_blocks > 0 && active_blocks < kWideMinBlocks;
     if (old || too_small) {
@@ -2979,7 +2992,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         const char* v = std::getenv("STRATA_TOPK_STREAM");
         return v == nullptr || v[0] != '0';
     }();
-    if (reach > fit || (turing_wide && counted && reach > 22528)) {   // past the register kernel's reach, or Turing's band
+    if (gfx906_no_reg || reach > fit || (turing_wide && counted && reach > 22528)) {   // past the register kernel's reach, or Turing / gfx906
 #if !defined(__HIPCC__)
         if (counted && nq <= TS_MAXQ && reach > 28672 && topk_sample_on()) {   // one read of the scores (below ~115K cells the wide kernel is as fast)
             block_topk_sample_kernel<<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
