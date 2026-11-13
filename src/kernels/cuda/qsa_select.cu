@@ -2078,6 +2078,9 @@ bool scores_thread_on() {
 bool scores_halve_on() {
     static const int env = [] { const char* v = std::getenv("STRATA_SCORES_HALVE"); return v ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
     if (env >= 0) return env != 0;
+#if defined(__HIPCC__)
+    if (scores_thread_arch() == 3) return true;   // gfx906: register-cached queries + halved shuffle reductions
+#endif
     static int ok[64] = {};   // 0 unknown, 1 yes, 2 no
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }

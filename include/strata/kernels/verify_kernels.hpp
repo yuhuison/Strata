@@ -30,6 +30,19 @@ inline constexpr int kVerifyMaxT = kWindowMaxT;
 /// Batch and pipelined windows stay at kVerifyMaxT.
 inline constexpr int kVerifyLongT = kVerifyMaxT > kVerifyNarrowT ? kVerifyMaxT : 2 * kVerifyMaxT;
 
+/// Device-readable topology descriptor for multi-branch speculative tree verification (STRATA_SPEC_TREE / --spec-tree).
+/// Size is a multiple of 16 bytes so `copy_from_mapped` uploads it inside the captured verify graph.
+struct VerifyTreeMap {
+    int64_t pos0;
+    int32_t n_tok;
+    uint32_t branch_mask;                  // bit t = 1 iff some later node branches from slot t (par[c] == t && c != t + 1)
+    int32_t parent[kVerifyMaxT];           // parent[0] = -1, 0 <= parent[t] < t for t > 0
+    int32_t depth[kVerifyMaxT];            // logical tree depth: depth[0] = 0, depth[t] = depth[parent[t]] + 1
+    int32_t anc_conv[kVerifyMaxT][4];      // < 0: history[anc + 3]; >= 0: qkv[anc]
+    int32_t anc_slot[kVerifyMaxT][kVerifyMaxT]; // anc_slot[t][d] = physical window slot at logical depth d along root..t
+};
+static_assert(sizeof(VerifyTreeMap) % 16 == 0, "VerifyTreeMap must be 16-byte aligned for copy_from_mapped");
+
 /// For token t of T: conv over [history(3) | qkv_0 .. qkv_t] -> SiLU -> L2 norm of the q/k heads -> h[t].
 /// `history` is NOT written, but with `commit` (one token): it then keeps the token, as gdn_conv_commit.  Bitwise
 /// `fused_gdn_conv_l2` per token.
@@ -65,6 +78,24 @@ void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_chan
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
                          const int32_t* n_keep, void* stream, int t_out_begin = 0, void* xq_out = nullptr);
+/// Tree-topology GDN conv + L2 norm, fused conv + a/b, and branching state recurrence (STRATA_SPEC_TREE).
+void gdn_conv_l2_tree(const float* history, const float* qkv, const float* conv_w, float* h, int channels,
+                      int qk_heads, float eps, int n_tok, const VerifyTreeMap* tree, void* stream, int t_begin = 0);
+void gdn_conv_ab_tree(const float* history, const float* qkv, const float* conv_w, float* h, int channels,
+                      int qk_heads, float eps, int n_tok, int t_begin, const VerifyTreeMap* tree, const float* x,
+                      const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
+                      float* gate, float* beta, int n_embd, int h_v, void* stream);
+void gdn_step_norm_tree(const float* state, float* snap, const float* h, int conv_channels, const float* gate,
+                        const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
+                        int n_tok, const VerifyTreeMap* tree, void* stream, void* xq_out = nullptr);
+/// Remaps QSA selected logical tail cells `id >= tree->pos0` to physical window KV cells `pos0 + tree->anc_slot[q][id - pos0]`.
+void qsa_remap_tree_sel(int32_t* sel, const int32_t* steps, int n_tok, int64_t cap, const VerifyTreeMap* tree, void* stream);
+/// Compacts row `src_row` -> `dst_row` across `n_layers` strided buffers (`row_floats` multiple of 4).
+void verify_compact_row(float* base, int64_t layer_stride, int n_layers, int src_row, int dst_row, int64_t row_floats,
+                        void* stream);
+/// Device-side runner-up (top-2) extraction for MTP row 0 after `row_top_prob`, writing mapped `out_id2` and `out_prob2`.
+void row_top2_mapped(const float* logits, int n_vocab, const int32_t* top1_raw, const float* top1_prob,
+                     const int32_t* dvocab, int32_t* out_id2, float* out_prob2, void* stream);
 /// The commit of `n_layers` GDN layers in two launches (engine-latency): layer i's conv history is
 /// `state + i * state_stride + conv_off` and its qkv rows `qkv + i * qkv_stride`, as gdn_conv_commit; its recurrence
 /// state `state + i * state_stride` over the first *n_keep rows of `h + i * h_stride` / `gate|beta + i * gb_stride`, as

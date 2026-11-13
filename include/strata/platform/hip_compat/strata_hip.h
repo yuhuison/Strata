@@ -196,15 +196,85 @@ inline hipError_t cudaInitDevice(int device, unsigned int device_flags, unsigned
 #if defined(__HIP_DEVICE_COMPILE__) || defined(__HIPCC__)
 
 // Logical 32-lane warps (see the header comment).  The width argument, when given, wins.
-#define __shfl_sync(mask, var, lane, ...) __shfl(var, lane, STRATA_SHFL_W(__VA_ARGS__))
-#define __shfl_up_sync(mask, var, delta, ...) __shfl_up(var, delta, STRATA_SHFL_W(__VA_ARGS__))
-#define __shfl_down_sync(mask, var, delta, ...) __shfl_down(var, delta, STRATA_SHFL_W(__VA_ARGS__))
-#define __shfl_xor_sync(mask, var, lanemask, ...) __shfl_xor(var, lanemask, STRATA_SHFL_W(__VA_ARGS__))
-// STRATA_SHFL_W() -> 32, STRATA_SHFL_W(w) -> w
 #define STRATA_SHFL_W(...) STRATA_SHFL_W_I(dummy, ##__VA_ARGS__, STRATA_SHFL_W_GIVEN, STRATA_SHFL_W_DEFAULT)(__VA_ARGS__)
 #define STRATA_SHFL_W_I(d, a, b, ...) b
 #define STRATA_SHFL_W_GIVEN(w) (w)
 #define STRATA_SHFL_W_DEFAULT(...) 32
+
+#if defined(__gfx906__) && !defined(STRATA_NO_GFX906_DPP)
+static __device__ __forceinline__ int strata_gfx906_shfl_xor_i32(unsigned int mask, int v, int lanemask, int width) {
+    if (__builtin_constant_p(mask) && __builtin_constant_p(lanemask) && __builtin_constant_p(width) &&
+        mask == 0xffffffffu && (width == 64 || width == 32 || width == 16 || width == 8 || width == 4 || width == 2) &&
+        lanemask > 0 && lanemask < width && lanemask < 32) {
+        #define STRATA_SWZ_XOR_CASE(M) case (M): return __builtin_amdgcn_ds_swizzle(v, 0x001f | ((M) << 10))
+        switch (lanemask) {
+            case 1:  return __builtin_amdgcn_mov_dpp(v, 0xb1, 0xf, 0xf, true);
+            case 2:  return __builtin_amdgcn_mov_dpp(v, 0x4e, 0xf, 0xf, true);
+            case 8:  return __builtin_amdgcn_mov_dpp(v, 0x128, 0xf, 0xf, true);
+            STRATA_SWZ_XOR_CASE(3);  STRATA_SWZ_XOR_CASE(4);  STRATA_SWZ_XOR_CASE(5);  STRATA_SWZ_XOR_CASE(6);
+            STRATA_SWZ_XOR_CASE(7);  STRATA_SWZ_XOR_CASE(9);  STRATA_SWZ_XOR_CASE(10); STRATA_SWZ_XOR_CASE(11);
+            STRATA_SWZ_XOR_CASE(12); STRATA_SWZ_XOR_CASE(13); STRATA_SWZ_XOR_CASE(14); STRATA_SWZ_XOR_CASE(15);
+            STRATA_SWZ_XOR_CASE(16); STRATA_SWZ_XOR_CASE(17); STRATA_SWZ_XOR_CASE(18); STRATA_SWZ_XOR_CASE(19);
+            STRATA_SWZ_XOR_CASE(20); STRATA_SWZ_XOR_CASE(21); STRATA_SWZ_XOR_CASE(22); STRATA_SWZ_XOR_CASE(23);
+            STRATA_SWZ_XOR_CASE(24); STRATA_SWZ_XOR_CASE(25); STRATA_SWZ_XOR_CASE(26); STRATA_SWZ_XOR_CASE(27);
+            STRATA_SWZ_XOR_CASE(28); STRATA_SWZ_XOR_CASE(29); STRATA_SWZ_XOR_CASE(30); STRATA_SWZ_XOR_CASE(31);
+            default: break;
+        }
+        #undef STRATA_SWZ_XOR_CASE
+    }
+    return __shfl_xor(v, lanemask, width);
+}
+
+static __device__ __forceinline__ int strata_gfx906_shfl_idx_i32(unsigned int mask, int v, int src_lane, int width) {
+    if (__builtin_constant_p(mask) && __builtin_constant_p(src_lane) && __builtin_constant_p(width) &&
+        mask == 0xffffffffu && width == 32) {
+        #define STRATA_SWZ_IDX_CASE(L) case (L): return __builtin_amdgcn_ds_swizzle(v, (L) << 5)
+        switch (src_lane & 31) {
+            STRATA_SWZ_IDX_CASE(0);  STRATA_SWZ_IDX_CASE(1);  STRATA_SWZ_IDX_CASE(2);  STRATA_SWZ_IDX_CASE(3);
+            STRATA_SWZ_IDX_CASE(4);  STRATA_SWZ_IDX_CASE(5);  STRATA_SWZ_IDX_CASE(6);  STRATA_SWZ_IDX_CASE(7);
+            STRATA_SWZ_IDX_CASE(8);  STRATA_SWZ_IDX_CASE(9);  STRATA_SWZ_IDX_CASE(10); STRATA_SWZ_IDX_CASE(11);
+            STRATA_SWZ_IDX_CASE(12); STRATA_SWZ_IDX_CASE(13); STRATA_SWZ_IDX_CASE(14); STRATA_SWZ_IDX_CASE(15);
+            STRATA_SWZ_IDX_CASE(16); STRATA_SWZ_IDX_CASE(17); STRATA_SWZ_IDX_CASE(18); STRATA_SWZ_IDX_CASE(19);
+            STRATA_SWZ_IDX_CASE(20); STRATA_SWZ_IDX_CASE(21); STRATA_SWZ_IDX_CASE(22); STRATA_SWZ_IDX_CASE(23);
+            STRATA_SWZ_IDX_CASE(24); STRATA_SWZ_IDX_CASE(25); STRATA_SWZ_IDX_CASE(26); STRATA_SWZ_IDX_CASE(27);
+            STRATA_SWZ_IDX_CASE(28); STRATA_SWZ_IDX_CASE(29); STRATA_SWZ_IDX_CASE(30); STRATA_SWZ_IDX_CASE(31);
+            default: break;
+        }
+        #undef STRATA_SWZ_IDX_CASE
+    }
+    return __shfl(v, src_lane, width);
+}
+
+static __device__ __forceinline__ int strata_shfl_xor_sync(unsigned int m, int v, int lm, int w) { return strata_gfx906_shfl_xor_i32(m, v, lm, w); }
+static __device__ __forceinline__ unsigned int strata_shfl_xor_sync(unsigned int m, unsigned int v, int lm, int w) { return (unsigned int) strata_gfx906_shfl_xor_i32(m, (int) v, lm, w); }
+static __device__ __forceinline__ float strata_shfl_xor_sync(unsigned int m, float v, int lm, int w) { return __int_as_float(strata_gfx906_shfl_xor_i32(m, __float_as_int(v), lm, w)); }
+static __device__ __forceinline__ __half2 strata_shfl_xor_sync(unsigned int m, __half2 v, int lm, int w) { return __builtin_bit_cast(__half2, strata_gfx906_shfl_xor_i32(m, __builtin_bit_cast(int, v), lm, w)); }
+static __device__ __forceinline__ __half strata_shfl_xor_sync(unsigned int m, __half v, int lm, int w) { return __shfl_xor(v, lm, w); }
+static __device__ __forceinline__ long strata_shfl_xor_sync(unsigned int m, long v, int lm, int w) { return __shfl_xor(v, lm, w); }
+static __device__ __forceinline__ unsigned long strata_shfl_xor_sync(unsigned int m, unsigned long v, int lm, int w) { return __shfl_xor(v, lm, w); }
+static __device__ __forceinline__ long long strata_shfl_xor_sync(unsigned int m, long long v, int lm, int w) { return __shfl_xor(v, lm, w); }
+static __device__ __forceinline__ unsigned long long strata_shfl_xor_sync(unsigned int m, unsigned long long v, int lm, int w) { return __shfl_xor(v, lm, w); }
+static __device__ __forceinline__ double strata_shfl_xor_sync(unsigned int m, double v, int lm, int w) { return __shfl_xor(v, lm, w); }
+
+static __device__ __forceinline__ int strata_shfl_sync(unsigned int m, int v, int l, int w) { return strata_gfx906_shfl_idx_i32(m, v, l, w); }
+static __device__ __forceinline__ unsigned int strata_shfl_sync(unsigned int m, unsigned int v, int l, int w) { return (unsigned int) strata_gfx906_shfl_idx_i32(m, (int) v, l, w); }
+static __device__ __forceinline__ float strata_shfl_sync(unsigned int m, float v, int l, int w) { return __int_as_float(strata_gfx906_shfl_idx_i32(m, __float_as_int(v), l, w)); }
+static __device__ __forceinline__ __half2 strata_shfl_sync(unsigned int m, __half2 v, int l, int w) { return __builtin_bit_cast(__half2, strata_gfx906_shfl_idx_i32(m, __builtin_bit_cast(int, v), l, w)); }
+static __device__ __forceinline__ __half strata_shfl_sync(unsigned int m, __half v, int l, int w) { return __shfl(v, l, w); }
+static __device__ __forceinline__ long strata_shfl_sync(unsigned int m, long v, int l, int w) { return __shfl(v, l, w); }
+static __device__ __forceinline__ unsigned long strata_shfl_sync(unsigned int m, unsigned long v, int l, int w) { return __shfl(v, l, w); }
+static __device__ __forceinline__ long long strata_shfl_sync(unsigned int m, long long v, int l, int w) { return __shfl(v, l, w); }
+static __device__ __forceinline__ unsigned long long strata_shfl_sync(unsigned int m, unsigned long long v, int l, int w) { return __shfl(v, l, w); }
+static __device__ __forceinline__ double strata_shfl_sync(unsigned int m, double v, int l, int w) { return __shfl(v, l, w); }
+
+#define __shfl_sync(mask, var, lane, ...) strata_shfl_sync((mask), (var), (lane), STRATA_SHFL_W(__VA_ARGS__))
+#define __shfl_xor_sync(mask, var, lanemask, ...) strata_shfl_xor_sync((mask), (var), (lanemask), STRATA_SHFL_W(__VA_ARGS__))
+#else
+#define __shfl_sync(mask, var, lane, ...) __shfl(var, lane, STRATA_SHFL_W(__VA_ARGS__))
+#define __shfl_xor_sync(mask, var, lanemask, ...) __shfl_xor(var, lanemask, STRATA_SHFL_W(__VA_ARGS__))
+#endif
+#define __shfl_up_sync(mask, var, delta, ...) __shfl_up(var, delta, STRATA_SHFL_W(__VA_ARGS__))
+#define __shfl_down_sync(mask, var, delta, ...) __shfl_down(var, delta, STRATA_SHFL_W(__VA_ARGS__))
 #define __all_sync(mask, pred) __all(pred)
 #define __any_sync(mask, pred) __any(pred)
 

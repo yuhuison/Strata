@@ -934,10 +934,43 @@ template<int TY> inline constexpr bool kStageIqGrid = (TY == 16 || TY == 17 || T
 __device__ __forceinline__ void iq_sync_lds() {
 #if defined(__gfx1200__) || defined(__gfx1201__)
     asm volatile("s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait -1" ::: "memory");
+#elif defined(__gfx906__) && !defined(STRATA_NO_GFX906_LDS_BARRIER)
+    asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
 #else
     __syncthreads();   // every other target keeps the full barrier (the other HIP targets were not run for this change)
 #endif
 }
+
+#if defined(__gfx906__) && !defined(STRATA_NO_GFX906_LDS_DMA)
+typedef int32_t iq_gfx906_i32x4 __attribute__((ext_vector_type(4)));
+
+template<int WORDS, int NTHREADS>
+__device__ __forceinline__ void gfx906_lds_dma_words_async(uint32_t* s_dst, const void* g_src, int tid) {
+    static_assert(WORDS % 64 == 0 && NTHREADS % 64 == 0 && WORDS % NTHREADS == 0, "whole wave64 tiles");
+    const uint64_t addr = (uint64_t) (uintptr_t) g_src;
+    iq_gfx906_i32x4 srd;
+    srd.x = (int32_t) (addr & 0xffffffffull);
+    srd.y = (int32_t) ((addr >> 32) & 0x0000ffffull);
+    srd.z = (int32_t) (WORDS * 4u);
+    srd.w = 0x00020000;
+    const uint32_t voff = (uint32_t) (tid & 63) * 4u;
+    const uint32_t wave_bytes = __builtin_amdgcn_readfirstlane((uint32_t) tid >> 6) * 256u;
+    const uint32_t lds_base = __builtin_amdgcn_readfirstlane(
+        (uint32_t) (uintptr_t) (__attribute__((address_space(3))) const char*) s_dst) + wave_bytes;
+#pragma unroll
+    for (int l0 = 0; l0 < WORDS; l0 += NTHREADS) {
+        const uint32_t soff = wave_bytes + (uint32_t) (l0 * 4);
+        const uint32_t m0_val = lds_base + (uint32_t) (l0 * 4);
+        asm volatile(
+            "s_mov_b32 m0, %0\n\t"
+            "buffer_load_dword %1, %2, %3 offen offset:0 lds\n\t"
+            :
+            : "s"(m0_val), "v"(voff), "s"(srd), "s"(soff)
+            : "memory"
+        );
+    }
+}
+#endif
 
 template<> inline constexpr bool kSplit<16> = true;
 template<> struct Split<16> {   // IQ2_XXS
@@ -1835,21 +1868,42 @@ __device__ __forceinline__ const uint32_t* stage_iq_grid(uint32_t* s_buf, int ti
     if constexpr (!STAGE_GRID) {
         return nullptr;
     } else if constexpr (TY == 16) {
+#if defined(__gfx906__) && !defined(STRATA_NO_GFX906_LDS_DMA)
+        if (nthreads == 256) gfx906_lds_dma_words_async<512, 256>(s_buf, iq2xxs_grid, tid);
+        else if (nthreads == 128) gfx906_lds_dma_words_async<512, 128>(s_buf, iq2xxs_grid, tid);
+        else { uint2* dst = (uint2*) s_buf; const uint2* src = (const uint2*) iq2xxs_grid; for (int i = tid; i < 256; i += nthreads) dst[i] = src[i]; }
+        asm volatile("s_waitcnt vmcnt(0)\n\t" ::: "memory");
+#else
         uint2* dst = (uint2*) s_buf;
         const uint2* src = (const uint2*) iq2xxs_grid;
         for (int i = tid; i < 256; i += nthreads) dst[i] = src[i];
+#endif
         iq_sync_lds();
         return s_buf;
     } else if constexpr (TY == 17) {
+#if defined(__gfx906__) && !defined(STRATA_NO_GFX906_LDS_DMA)
+        if (nthreads == 256) gfx906_lds_dma_words_async<1024, 256>(s_buf, iq2xs_grid, tid);
+        else if (nthreads == 128) gfx906_lds_dma_words_async<1024, 128>(s_buf, iq2xs_grid, tid);
+        else { uint2* dst = (uint2*) s_buf; const uint2* src = (const uint2*) iq2xs_grid; for (int i = tid; i < 512; i += nthreads) dst[i] = src[i]; }
+        asm volatile("s_waitcnt vmcnt(0)\n\t" ::: "memory");
+#else
         uint2* dst = (uint2*) s_buf;
         const uint2* src = (const uint2*) iq2xs_grid;
         for (int i = tid; i < 512; i += nthreads) dst[i] = src[i];
+#endif
         iq_sync_lds();
         return s_buf;
     } else if constexpr (TY == 22) {
+#if defined(__gfx906__) && !defined(STRATA_NO_GFX906_LDS_DMA)
+        if (nthreads == 256) gfx906_lds_dma_words_async<2048, 256>(s_buf, iq2s_grid, tid);
+        else if (nthreads == 128) gfx906_lds_dma_words_async<2048, 128>(s_buf, iq2s_grid, tid);
+        else { uint2* dst = (uint2*) s_buf; const uint2* src = (const uint2*) iq2s_grid; for (int i = tid; i < 1024; i += nthreads) dst[i] = src[i]; }
+        asm volatile("s_waitcnt vmcnt(0)\n\t" ::: "memory");
+#else
         uint2* dst = (uint2*) s_buf;
         const uint2* src = (const uint2*) iq2s_grid;
         for (int i = tid; i < 1024; i += nthreads) dst[i] = src[i];
+#endif
         iq_sync_lds();
         return s_buf;
     } else if constexpr (TY == 29) {
@@ -2484,11 +2538,29 @@ constexpr int ED_HB = 20;       // q8_1 blocks of a down row (n_ff 640)
 // the codebook of a gate/up format in shared memory: words, and the copy (every thread of the block; sync after)
 template<int TG> struct EdGrid;
 template<> struct EdGrid<16> { static constexpr int words = 512;
-    __device__ static void copy(uint32_t* s, int tid) { const uint2* src = (const uint2*) iq2xxs_grid; uint2* dst = (uint2*) s; for (int i = tid; i < 256; i += 256) dst[i] = src[i]; } };
+    __device__ static void copy(uint32_t* s, int tid) {
+#if defined(__gfx906__) && !defined(STRATA_NO_GFX906_LDS_DMA)
+        gfx906_lds_dma_words_async<512, 256>(s, iq2xxs_grid, tid);
+#else
+        const uint2* src = (const uint2*) iq2xxs_grid; uint2* dst = (uint2*) s; for (int i = tid; i < 256; i += 256) dst[i] = src[i];
+#endif
+    } };
 template<> struct EdGrid<17> { static constexpr int words = 1024;
-    __device__ static void copy(uint32_t* s, int tid) { const uint2* src = (const uint2*) iq2xs_grid; uint2* dst = (uint2*) s; for (int i = tid; i < 512; i += 256) dst[i] = src[i]; } };
+    __device__ static void copy(uint32_t* s, int tid) {
+#if defined(__gfx906__) && !defined(STRATA_NO_GFX906_LDS_DMA)
+        gfx906_lds_dma_words_async<1024, 256>(s, iq2xs_grid, tid);
+#else
+        const uint2* src = (const uint2*) iq2xs_grid; uint2* dst = (uint2*) s; for (int i = tid; i < 512; i += 256) dst[i] = src[i];
+#endif
+    } };
 template<> struct EdGrid<22> { static constexpr int words = 2048;
-    __device__ static void copy(uint32_t* s, int tid) { const uint2* src = (const uint2*) iq2s_grid; uint2* dst = (uint2*) s; for (int i = tid; i < 1024; i += 256) dst[i] = src[i]; } };
+    __device__ static void copy(uint32_t* s, int tid) {
+#if defined(__gfx906__) && !defined(STRATA_NO_GFX906_LDS_DMA)
+        gfx906_lds_dma_words_async<2048, 256>(s, iq2s_grid, tid);
+#else
+        const uint2* src = (const uint2*) iq2s_grid; uint2* dst = (uint2*) s; for (int i = tid; i < 1024; i += 256) dst[i] = src[i];
+#endif
+    } };
 // (IQ3_XXS / IQ3_S: the codebook and, behind it, the sign-mask tables Split<TG>::load<true> reads - stage_iq_grid's layout)
 template<> struct EdGrid<18> { static constexpr int words = 512;
     __device__ static void copy(uint32_t* s, int tid) {
@@ -2609,6 +2681,9 @@ __global__ void __launch_bounds__(256, MINB) expdec_gu_kernel(
     STRATA_SHARED_ALIGN16_U32(s_grid_buf, EdGrid<TG>::words);
     const int tid = threadIdx.x;
     EdGrid<TG>::copy(s_grid_buf, tid);   // visible after the staging's iq_sync_lds
+#if defined(__gfx906__) && !defined(STRATA_NO_GFX906_LDS_DMA)
+    bool grid_waited = false;
+#endif
     const int sw = tid >> 4, t = tid & 15;
     const int nrow = 2 * (int) L.n_ff, n_ff = (int) L.n_ff;
     const int row_base = blockIdx.x * rb;
@@ -2619,6 +2694,12 @@ __global__ void __launch_bounds__(256, MINB) expdec_gu_kernel(
             const int n = min(ED_NC, e1 - e);
             if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
             for (int c = 0; c < n; ++c) ed_stage_entry<ED_XB, true>(s_u, s_ds, c, xq + (size_t) ent_tok[e + c] * ED_XB, tid);
+#if defined(__gfx906__) && !defined(STRATA_NO_GFX906_LDS_DMA)
+            if (!grid_waited) {
+                asm volatile("s_waitcnt vmcnt(0)\n\t" ::: "memory");
+                grid_waited = true;
+            }
+#endif
             iq_sync_lds();
             for (int p = 0; p * 16 * R < rb; ++p) {
                 const int row0 = row_base + p * 16 * R + sw * R;

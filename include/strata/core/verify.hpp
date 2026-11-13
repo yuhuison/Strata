@@ -229,6 +229,17 @@ public:
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
 
+    /// STRATA_SPEC_TREE / --spec-tree: true when this single-stage greedy verifier can run a branching tree window.
+    bool can_tree_verify() const {
+        return lb_ == 0 && next_ == nullptr && (le_ < 0 || (g_ != nullptr && le_ == g_->n_layers)) &&
+               head_sampling_ && (sampling_.greedy || sampling_.temperature <= 0.0f) &&
+               sampling_.logit_bias == nullptr && !spec_measure_ && spec_q_ == nullptr && !always_publish_ && !tap_on_;
+    }
+    /// Arms `spec` for the NEXT `run()` call only (cleared automatically on return).
+    void set_tree_spec(const strata::kernels::VerifyTreeMap* spec) { tree_spec_ = spec; }
+    /// Compacts accepted physical slots `path[0 .. n_keep - 1]` into contiguous slots `0 .. n_keep - 1` before `commit(n_keep)`.
+    bool compact_tree_path(const int* path, int n_keep, std::string& err);
+
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
     // A batch window holds S INDEPENDENT sequences, one token each: row s is slot s, at slot s's own position,
@@ -453,6 +464,17 @@ private:
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
     int brow_[strata::kernels::kWindowMaxT] = {};                     ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
+    bool tree_rec_ = false;                ///< record_window is capturing a tree window
+    bool last_tree_ = false;               ///< the last run was a tree window (G = 1)
+    const strata::kernels::VerifyTreeMap* tree_spec_ = nullptr;
+    bool capture_tree(int T, std::string& err);
+    cudaGraphExec_t exec_tree_[2][strata::kernels::kVerifyNarrowT + 1] = {};
+    cudaGraphExec_t exec_tree_nr_[2][strata::kernels::kVerifyNarrowT + 1] = {};
+    bool launched_tree_[2][strata::kernels::kVerifyNarrowT + 1] = {};
+    bool launched_tree_nr_[2][strata::kernels::kVerifyNarrowT + 1] = {};
+    int32_t *h_step_append_ = nullptr, *m_step_append_ = nullptr, *step_append_ = nullptr;
+    strata::kernels::VerifyTreeMap *h_tree_ = nullptr, *m_tree_ = nullptr, *tree_d_ = nullptr;
+    float* tree_gdn_snap_ = nullptr;
     std::map<std::vector<int>, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< full row layout avoids slot-ID collisions
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU)
     uint64_t bm_tick_ = 0;

@@ -871,6 +871,36 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 
 // ---------------------------------------------------------------------------------------------
 
+#if defined(GGML_USE_HIP) && defined(__gfx906__) && !defined(STRATA_NO_GFX906_LDS_DMA)
+typedef int32_t ggml_gfx906_i32x4 __attribute__((ext_vector_type(4)));
+
+template <int N_INTS, int NTHREADS>
+static __device__ __forceinline__ void gfx906_mmq_load_tile_y(int * tile_y, const int * by0) {
+    const uint64_t addr = (uint64_t) (uintptr_t) by0;
+    ggml_gfx906_i32x4 srd;
+    srd.x = (int32_t) (addr & 0xffffffffull);
+    srd.y = (int32_t) ((addr >> 32) & 0x0000ffffull);
+    srd.z = (int32_t) (GGML_PAD(N_INTS, NTHREADS) * 4u);
+    srd.w = 0x00020000;
+    const uint32_t voff = (uint32_t) threadIdx.x * 4u;
+    const uint32_t wave_bytes = __builtin_amdgcn_readfirstlane((uint32_t) threadIdx.y) * 256u;
+    const uint32_t lds_base = __builtin_amdgcn_readfirstlane(
+        (uint32_t) (uintptr_t) (__attribute__((address_space(3))) const char *) tile_y) + wave_bytes;
+#pragma unroll
+    for (int l0 = 0; l0 < N_INTS; l0 += NTHREADS) {
+        const uint32_t soff = wave_bytes + (uint32_t) (l0 * 4);
+        const uint32_t m0_val = lds_base + (uint32_t) (l0 * 4);
+        asm volatile(
+            "s_mov_b32 m0, %0\n\t"
+            "buffer_load_dword %1, %2, %3 offen offset:0 lds\n\t"
+            :
+            : "s"(m0_val), "v"(voff), "s"(srd), "s"(soff)
+            : "memory"
+        );
+    }
+}
+#endif
+
 template <ggml_type type, int J, bool fallback, bool fixup>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
@@ -906,6 +936,14 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__) && !defined(STRATA_NO_GFX906_LDS_DMA)
+        {
+            const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+            gfx906_mmq_load_tile_y<J * MMQ_TILE_Y_K, nwarps * warp_size>(tile_y, by0);
+        }
+        load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+        asm volatile("s_waitcnt vmcnt(0)\n\t" ::: "memory");
+#else
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
@@ -916,6 +954,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                 tile_y[l] = by0[l];
             }
         }
+#endif
 
         __syncthreads();
 
@@ -923,6 +962,13 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
+#if defined(GGML_USE_HIP) && defined(__gfx906__) && !defined(STRATA_NO_GFX906_LDS_DMA)
+        {
+            const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+            gfx906_mmq_load_tile_y<J * MMQ_TILE_Y_K, nwarps * warp_size>(tile_y, by0);
+        }
+        asm volatile("s_waitcnt vmcnt(0)\n\t" ::: "memory");
+#else
         {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
 #pragma unroll
@@ -932,6 +978,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                 tile_y[l] = by0[l];
             }
         }
+#endif
 
         __syncthreads();
 

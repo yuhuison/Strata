@@ -31,7 +31,36 @@
 #define CU_CHECK(fn) {hipError_t err = fn; if(err != hipSuccess) { GGML_ABORT("HipVMM Failure: %s\n", hipGetErrorString(err)); }}
 #define __shfl_sync(mask, var, laneMask, width) __shfl(var, laneMask, width)
 #define __shfl_up_sync(mask, var, laneMask, width) __shfl_up(var, laneMask, width)
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx906__) && !defined(STRATA_NO_GFX906_DPP)
+static __device__ __forceinline__ int ggml_gfx906_shfl_xor_i32(unsigned int mask, int v, int lanemask, int width) {
+    if (__builtin_constant_p(mask) && __builtin_constant_p(lanemask) && __builtin_constant_p(width) &&
+        mask == 0xffffffffu && (width == 64 || width == 32 || width == 16 || width == 8 || width == 4 || width == 2) &&
+        lanemask > 0 && lanemask < width && lanemask < 32) {
+        switch (lanemask) {
+            case 1:  return __builtin_amdgcn_mov_dpp(v, 0xb1, 0xf, 0xf, true);
+            case 2:  return __builtin_amdgcn_mov_dpp(v, 0x4e, 0xf, 0xf, true);
+            case 4:  return __builtin_amdgcn_ds_swizzle(v, 0x001f | (4 << 10));
+            case 8:  return __builtin_amdgcn_mov_dpp(v, 0x128, 0xf, 0xf, true);
+            case 16: return __builtin_amdgcn_ds_swizzle(v, 0x001f | (16 << 10));
+            default: break;
+        }
+    }
+    return __shfl_xor(v, lanemask, width);
+}
+static __device__ __forceinline__ int ggml_gfx906_shfl_xor(unsigned int m, int v, int lm, int w) { return ggml_gfx906_shfl_xor_i32(m, v, lm, w); }
+static __device__ __forceinline__ unsigned int ggml_gfx906_shfl_xor(unsigned int m, unsigned int v, int lm, int w) { return (unsigned int) ggml_gfx906_shfl_xor_i32(m, (int) v, lm, w); }
+static __device__ __forceinline__ float ggml_gfx906_shfl_xor(unsigned int m, float v, int lm, int w) { return __int_as_float(ggml_gfx906_shfl_xor_i32(m, __float_as_int(v), lm, w)); }
+static __device__ __forceinline__ __half2 ggml_gfx906_shfl_xor(unsigned int m, __half2 v, int lm, int w) { return __builtin_bit_cast(__half2, ggml_gfx906_shfl_xor_i32(m, __builtin_bit_cast(int, v), lm, w)); }
+static __device__ __forceinline__ __half ggml_gfx906_shfl_xor(unsigned int m, __half v, int lm, int w) { return __shfl_xor(v, lm, w); }
+static __device__ __forceinline__ long ggml_gfx906_shfl_xor(unsigned int m, long v, int lm, int w) { return __shfl_xor(v, lm, w); }
+static __device__ __forceinline__ unsigned long ggml_gfx906_shfl_xor(unsigned int m, unsigned long v, int lm, int w) { return __shfl_xor(v, lm, w); }
+static __device__ __forceinline__ long long ggml_gfx906_shfl_xor(unsigned int m, long long v, int lm, int w) { return __shfl_xor(v, lm, w); }
+static __device__ __forceinline__ unsigned long long ggml_gfx906_shfl_xor(unsigned int m, unsigned long long v, int lm, int w) { return __shfl_xor(v, lm, w); }
+static __device__ __forceinline__ double ggml_gfx906_shfl_xor(unsigned int m, double v, int lm, int w) { return __shfl_xor(v, lm, w); }
+#define __shfl_xor_sync(mask, var, laneMask, width) ggml_gfx906_shfl_xor((mask), (var), (laneMask), (width))
+#else
 #define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
+#endif
 #define __all_sync(mask, var) __all(var)
 #define __any_sync(mask, var) __any(var)
 #define cublasStrsmBatched hipblasStrsmBatched
