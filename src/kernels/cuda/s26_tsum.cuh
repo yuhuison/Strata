@@ -12,16 +12,29 @@
 namespace strata::kernels::s26ts {
 
 #if defined(__HIP_PLATFORM_AMD__) && !defined(STRATA_HIP_GFX906)   // (permlanex16 / DPP row_xmask: gfx10+ only)
-__device__ __forceinline__ float xmov16(float v) {
-    return __int_as_float(__builtin_amdgcn_permlanex16(__float_as_int(v), __float_as_int(v), 0x76543210u, 0xfedcba98u,
-                                                       false, false));
+template <int O>
+__device__ __forceinline__ int xmov_i(int x) {
+    if constexpr (O == 16) return __builtin_amdgcn_permlanex16(x, x, 0x76543210u, 0xfedcba98u, false, false);
+    else return __builtin_amdgcn_update_dpp(0, x, 0x160 + O, 0xf, 0xf, false);
 }
 template <int O>
-__device__ __forceinline__ float xmov(float v) {
-    if constexpr (O == 16) return xmov16(v);
-    else return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x160 + O, 0xf, 0xf, false));
+__device__ __forceinline__ float xmov(float v) { return __int_as_float(xmov_i<O>(__float_as_int(v))); }
+#elif defined(__gfx906__)
+template <int O>
+__device__ __forceinline__ int xmov_i(int x) {
+    if constexpr (O == 1) return __builtin_amdgcn_mov_dpp(x, 0x0b1, 0xf, 0xf, false);
+    else if constexpr (O == 2) return __builtin_amdgcn_mov_dpp(x, 0x04e, 0xf, 0xf, false);
+    else if constexpr (O == 4) {
+        int r = __builtin_amdgcn_update_dpp(0, x, 0x104, 0xf, 0x5, false);
+        return __builtin_amdgcn_update_dpp(r, x, 0x114, 0xf, 0xa, false);
+    } else if constexpr (O == 8) return __builtin_amdgcn_mov_dpp(x, 0x128, 0xf, 0xf, false);
+    else return __shfl_xor_sync(0xffffffffu, x, O, 32);
 }
+template <int O>
+__device__ __forceinline__ float xmov(float v) { return __int_as_float(xmov_i<O>(__float_as_int(v))); }
 #else
+template <int O>
+__device__ __forceinline__ int xmov_i(int x) { return __shfl_xor_sync(0xffffffffu, x, O, 32); }
 template <int O>
 __device__ __forceinline__ float xmov(float v) { return __shfl_xor_sync(0xffffffffu, v, O); }
 #endif

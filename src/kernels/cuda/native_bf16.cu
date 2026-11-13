@@ -40,9 +40,11 @@ namespace {
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 __device__ __forceinline__ float mmvf_warp_sum(float value) {
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        value += __shfl_xor_sync(0xffffffffu, value, offset, 32);
+    value += s26ts::xmov<16>(value);
+    value += s26ts::xmov<8>(value);
+    value += s26ts::xmov<4>(value);
+    value += s26ts::xmov<2>(value);
+    value += s26ts::xmov<1>(value);
     return value;
 }
 
@@ -314,7 +316,15 @@ void launch_rows(const float* x, int64_t ldx, const uint16_t* w, float* y, int64
                  cudaStream_t st, const uint16_t* w_aux = nullptr, float* y_aux = nullptr, int64_t ldy_aux = 0) {
     constexpr int RPB = 4;
     const unsigned nb = (unsigned) ((n_out + RPB - 1) / RPB);
-    static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
+    static const bool ts = [] {
+        const char* v = std::getenv("STRATA_TSUM");
+        if (v != nullptr) return v[0] == '1';
+#if defined(STRATA_HIP_GFX906)
+        return true;
+#else
+        return false;
+#endif
+    }();
     if (w_aux != nullptr) {   // S26 STRATA_LFUSE: + one aux row block
 #define S26_AUX(TSV) \
         if (n_tok <= 4) bf16_f32_mmvf_rows_kernel<B, 4, RPB, TSV, true><<<nb + 1, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux); \
@@ -324,12 +334,33 @@ void launch_rows(const float* x, int64_t ldx, const uint16_t* w, float* y, int64
         return;
     }
     if (ts) {
-        if (n_tok <= 4) bf16_f32_mmvf_rows_kernel<B, 4, RPB, true><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
+        if (n_tok == 1) bf16_f32_mmvf_rows_kernel<B, 1, RPB, true><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, 1);
+        else if (n_tok == 2) bf16_f32_mmvf_rows_kernel<B, 2, RPB, true><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, 2);
+        else if (n_tok <= 4) bf16_f32_mmvf_rows_kernel<B, 4, RPB, true><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
         else bf16_f32_mmvf_rows_kernel<B, 8, RPB, true><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
         return;
     }
-    if (n_tok <= 4) bf16_f32_mmvf_rows_kernel<B, 4, RPB><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
+    if (n_tok == 1) bf16_f32_mmvf_rows_kernel<B, 1, RPB><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, 1);
+    else if (n_tok == 2) bf16_f32_mmvf_rows_kernel<B, 2, RPB><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, 2);
+    else if (n_tok <= 4) bf16_f32_mmvf_rows_kernel<B, 4, RPB><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
     else bf16_f32_mmvf_rows_kernel<B, 8, RPB><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
+}
+
+int mmvf_rows_min_out() {
+    static const int min_out = [] {
+        const char* v = std::getenv("STRATA_MMVF_ROWS");
+        if (v != nullptr) return v[0] == '1' ? 64 : std::numeric_limits<int>::max();
+#if defined(STRATA_HIP_GFX906)
+        return 384;   // 128+ CTAs across 60 CUs (512 router / QSA q_proj, 2560 PLE); <= 256 avoids a 64-on-60 tail wave
+#else
+        return std::numeric_limits<int>::max();
+#endif
+    }();
+    return min_out;
+}
+bool mmvf_rows_explicit_one() {
+    static const bool ex = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
+    return ex;
 }
 
 void mmvf_chk_report() {
@@ -412,13 +443,12 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* 
 
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream) {
-    if (n_tok == 1 && ldy >= n_out) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }
+    if (n_tok == 1 && ldy >= n_out && !mmvf_rows_explicit_one()) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }
     if (n_tok < 1 || n_tok > STRATA_VERIFY_MAX_T || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 ||
         x == nullptr || w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
         throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows (16 in a wide build), even n_in/ldx, aligned pointers");
     const cudaStream_t st = (cudaStream_t) stream;
-    static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
-    if (rows && n_out >= 64 && n_tok <= 8) {   // (the opt-in rows kernels hold 8 columns: a wider window takes the switch below)
+    if (n_out >= mmvf_rows_min_out() && n_tok <= 8) {   // (the rows kernels hold up to 8 columns: a wider window takes the switch below)
         const int ni = (int) n_in, no = (int) n_out;
         switch (mmvf_block_size(n_in)) {
             case 32: launch_rows<32>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
@@ -486,6 +516,23 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
         (reinterpret_cast<uintptr_t>(y) & 3u) != 0)
         throw std::invalid_argument("bf16_gemv_fp32_mmvf: null or misaligned pointer");
     const cudaStream_t st = (cudaStream_t) stream;
+    if (!mmvf_rows_explicit_one() && n_out >= mmvf_rows_min_out()) {
+        const int ni = (int) n_in, no = (int) n_out;
+        switch (mmvf_block_size(n_in)) {
+            case 32: launch_rows<32>(x, n_in, w, y, n_out, ni, no, 1, st); break;
+            case 64: launch_rows<64>(x, n_in, w, y, n_out, ni, no, 1, st); break;
+            case 96: launch_rows<96>(x, n_in, w, y, n_out, ni, no, 1, st); break;
+            case 128: launch_rows<128>(x, n_in, w, y, n_out, ni, no, 1, st); break;
+            case 160: launch_rows<160>(x, n_in, w, y, n_out, ni, no, 1, st); break;
+            case 192: launch_rows<192>(x, n_in, w, y, n_out, ni, no, 1, st); break;
+            case 224: launch_rows<224>(x, n_in, w, y, n_out, ni, no, 1, st); break;
+            default: launch_rows<256>(x, n_in, w, y, n_out, ni, no, 1, st); break;
+        }
+        const cudaError_t result = cudaGetLastError();
+        if (result != cudaSuccess)
+            throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf launch: ") + cudaGetErrorString(result));
+        return;
+    }
 #define STRATA_MMVF_CASE(N) case N: \
     bf16_f32_mmvf_kernel<N><<<(unsigned) n_out, N, 0, st>>>(x, w, y, (int) n_in, mmvf_fast()); break
     switch (mmvf_block_size(n_in)) {

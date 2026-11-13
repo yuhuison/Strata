@@ -845,13 +845,12 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
     check("row_top_prob");
 }
 
-#if !defined(STRATA_HIP_GFX906)   // wave32 kernels (CUDA and RDNA HIP; wave64 gfx906 keeps the one-block kernels)
 namespace {
 
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
 constexpr int kArgMaxBlocks = 128, kArgThreads = 256, kTopBlocks = 32;   // RDNA HIP (#3264): single-warp blocks, no block barrier
 #else
-constexpr int kArgMaxBlocks = 128, kArgThreads = 256, kTopBlocks = 8;
+constexpr int kArgMaxBlocks = 128, kArgThreads = 256, kTopBlocks = 8;    // CUDA and Wave64 gfx906 (128 threads = 2 full wavefronts)
 #endif
 
 // the larger value, on equality the lower index: sampler_greedy_kernel's order
@@ -986,18 +985,6 @@ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int3
         logits, n_vocab, ids, probs, (TopRow*) scratch);
     check("row_top_prob_split");
 }
-#else
-uint64_t argmax_rows_scratch_bytes(int) { return 0; }
-void argmax_rows(const float*, int, int, void*, int32_t*, void*) {
-    std::fprintf(stderr, "argmax_rows: not built for this backend\n");
-    std::exit(1);
-}
-uint64_t row_top_prob_scratch_bytes(int) { return 0; }
-void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void*,
-                        void* stream) {
-    row_top_prob(logits, n_rows, n_vocab, ids, probs, stream);
-}
-#endif
 
 namespace {
 // grid (kNonfiniteBlocks, rows): block b of row t scans [b * per_block, +per_block) and writes its own word.  The
@@ -1023,15 +1010,14 @@ void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* fla
 }
 
 bool multi_block_head_ops() {
-#if defined(STRATA_HIP_GFX906)
-    return false;
-#else
     static const int env = [] {
         const char* v = std::getenv("STRATA_MULTI_BLOCK_ARGMAX");
         return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
     }();
     if (env == 0) return false;
-#if defined(__HIPCC__)
+#if defined(STRATA_HIP_GFX906)
+    return true;
+#elif defined(__HIPCC__)
     static int arch[64] = {};   // 0 unknown, 1 gfx12 (RDNA4: the only HIP target #3264 was run on), 2 other
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
@@ -1043,19 +1029,17 @@ bool multi_block_head_ops() {
 #else
     return true;
 #endif
-#endif
 }
 
 bool argmax_rows_wanted() {
-#if defined(STRATA_HIP_GFX906)
-    return false;
-#else
     static const int env = [] {
         const char* v = std::getenv("STRATA_ARGMAX_ROWS");
         return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
     }();
     if (env >= 0) return env != 0 && multi_block_head_ops();
-#if defined(__HIPCC__)
+#if defined(STRATA_HIP_GFX906)
+    return multi_block_head_ops();
+#elif defined(__HIPCC__)
     static int arch[64] = {};   // 0 unknown, 1 gfx12 (RDNA4), 2 other
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
@@ -1077,7 +1061,6 @@ bool argmax_rows_wanted() {
         return major == 8;
     }();
     return want && multi_block_head_ops();
-#endif
 #endif
 }
 

@@ -21,6 +21,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "strata/kernels/native_router.hpp"
+#include "s26_tsum.cuh"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cfloat>
@@ -32,14 +33,32 @@ namespace strata::kernels {
 namespace {
 std::atomic<bool> enabled{false};
 __device__ __forceinline__ float warp_sum(float value) {
-#pragma unroll
-    for (int mask = 16; mask; mask >>= 1) value += __shfl_xor_sync(0xffffffffu, value, mask, 32);
+    value += s26ts::xmov<16>(value);
+    value += s26ts::xmov<8>(value);
+    value += s26ts::xmov<4>(value);
+    value += s26ts::xmov<2>(value);
+    value += s26ts::xmov<1>(value);
     return value;
 }
 __device__ __forceinline__ float warp_max(float value) {
-#pragma unroll
-    for (int mask = 16; mask; mask >>= 1) value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, mask, 32));
+    value = fmaxf(value, s26ts::xmov<16>(value));
+    value = fmaxf(value, s26ts::xmov<8>(value));
+    value = fmaxf(value, s26ts::xmov<4>(value));
+    value = fmaxf(value, s26ts::xmov<2>(value));
+    value = fmaxf(value, s26ts::xmov<1>(value));
     return value;
+}
+__device__ __forceinline__ void warp_argmax32(float& best, int& expert) {
+    auto step = [&]<int M>() {
+        const float other = s26ts::xmov<M>(best);
+        const int other_id = s26ts::xmov_i<M>(expert);
+        if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
+    };
+    step.template operator()<16>();
+    step.template operator()<8>();
+    step.template operator()<4>();
+    step.template operator()<2>();
+    step.template operator()<1>();
 }
 __launch_bounds__(256, 1)
 __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ ids,
@@ -52,7 +71,9 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
     float values[16];
 #pragma unroll
     for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
+#if !defined(STRATA_HIP_GFX906)
     __syncthreads();
+#endif
     float maximum = -INFINITY;
 #pragma unroll
     for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
@@ -77,12 +98,7 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
         for (int i = 1; i < 16; ++i) {
             if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
         }
-#pragma unroll
-        for (int mask = 16; mask; mask >>= 1) {
-            const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
-            const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
-            if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
-        }
+        warp_argmax32(best, expert);
         if ((expert & 31) == lane) {
             values[expert / 32] = -INFINITY;
             ids[rank] = expert;
@@ -131,12 +147,7 @@ __global__ void route_multi(const float* __restrict__ logits, int32_t* __restric
         for (int i = 1; i < 16; ++i) {
             if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
         }
-#pragma unroll
-        for (int mask = 16; mask; mask >>= 1) {
-            const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
-            const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
-            if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
-        }
+        warp_argmax32(best, expert);
         if ((expert & 31) == lane) {
             values[expert / 32] = -INFINITY;
             ids[rank] = expert;
@@ -188,12 +199,7 @@ __global__ void route_topk(const float* __restrict__ logits, int32_t* __restrict
         for (int i = 1; i < V; ++i) {
             if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
         }
-#pragma unroll
-        for (int mask = 16; mask; mask >>= 1) {
-            const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
-            const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
-            if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
-        }
+        warp_argmax32(best, expert);
         if ((expert & 31) == lane) {
             values[expert / 32] = -INFINITY;
             ids[rank] = expert;

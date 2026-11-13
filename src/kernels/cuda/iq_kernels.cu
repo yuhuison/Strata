@@ -861,9 +861,23 @@ template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;    
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_nvfp4_q8_1(v, y, kbx, iqs); } };
 
 __device__ __forceinline__ float warp_sum(float v) {
+#if defined(__gfx906__)
+    v += __shfl_xor_sync(0xffffffffu, v, 16);
+    v += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x128, 0xf, 0xf, false));
+    {
+        const int x = __float_as_int(v);
+        int r = __builtin_amdgcn_update_dpp(0, x, 0x104, 0xf, 0x5, false);
+        r = __builtin_amdgcn_update_dpp(r, x, 0x114, 0xf, 0xa, false);
+        v += __int_as_float(r);
+    }
+    v += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x04e, 0xf, 0xf, false));
+    v += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x0b1, 0xf, 0xf, false));
+    return v;
+#else
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
+#endif
 }
 
 // One row against one q8_1 activation, the whole warp: call k = (block, part) is lane-strided.
@@ -5562,9 +5576,9 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
 #define STRATA_EXP_LAYOUTS 0
 #endif
 #if defined(STRATA_HIP_GFX906)
-constexpr int kExpModeDefault = 7;
+constexpr int kExpModeDefault = 8;
 constexpr int kExpFallback = 2;   // modes 5-8 on a format without an LDS kernel: R2
-constexpr bool kExpLds16 = false; // IQ2_XXS gate/up: R2 as measured on gfx906
+constexpr bool kExpLds16 = true;  // IQ2_XXS gate/up in LDS + fused Mode 8
 #else
 constexpr int kExpModeDefault = 0;
 constexpr int kExpFallback = 0;   // ... the CUDA layout (V100, IQ2_XXS gate/up: R2 183 us vs 113)
@@ -5742,9 +5756,11 @@ __global__ void __launch_bounds__(256) native_down_amd_kernel(const unsigned lon
 template<int TY> struct GridOf;
 template<> struct GridOf<22> { using T = uint64_t; static constexpr int N = 1024; __device__ static const T* src() { return iq2s_grid; } };
 template<> struct GridOf<16> { using T = uint64_t; static constexpr int N = 256; __device__ static const T* src() { return iq2xxs_grid; } };
+template<> struct GridOf<17> { using T = uint64_t; static constexpr int N = 512; __device__ static const T* src() { return iq2xs_grid; } };
 template<> struct GridOf<18> { using T = uint32_t; static constexpr int N = 256; __device__ static const T* src() { return iq3xxs_grid; } };
 template<> struct GridOf<21> { using T = uint32_t; static constexpr int N = 512; __device__ static const T* src() { return iq3s_grid; } };
 template<> struct GridOf<23> { using T = uint32_t; static constexpr int N = 1; __device__ static const T* src() { return iq3s_grid; } };   // IQ4_XS: no grid
+template<> struct GridOf<29> { using T = uint32_t; static constexpr int N = 2048; __device__ static const T* src() { return iq1s_grid_gpu; } };
 
 // SG = 1 (mode 6): the signs without byte-SIMD ops, which gfx906 lacks (strata_vcmpne4 / strata_vsub4 unpack to
 // ~12 word ops each).  m = the sign nibble as 0x00/0xff bytes; (g ^ m) is g or -g-1 per byte, so
@@ -5888,6 +5904,72 @@ template<int SG> struct DotG<16, SG> { __device__ static __forceinline__ float f
     return d * sumi;
 } };
 
+template<int SG> struct DotG<17, SG> { __device__ static __forceinline__ float f(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs,
+                                                      const uint64_t* grid) {
+    const block_iq2_xs* bq2 = (const block_iq2_xs*) vbq + kbx;
+    const int2 q2_packed = make_int2(get_int_b2(bq2->qs, iqs + 0), get_int_b2(bq2->qs, iqs + 1));
+    const uint16_t* q2 = (const uint16_t*) &q2_packed;
+    const int ls0 = bq2->scales[iqs / 2] & 0x0F;
+    const int ls1 = bq2->scales[iqs / 2] >> 4;
+    int sumi0 = 0, sumi1 = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const uint2 grid_pos = *(const uint2*) (grid + (q2[l0 / 2] & 0x1FF));
+        const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
+        int& acc = l0 < 4 ? sumi0 : sumi1;
+        if constexpr (SG == 1) {
+            const uint32_t v = q2[l0 / 2] >> 9, sg = v | ((__popc(v) & 1) << 7);
+            const int m0 = nib_mask(sg), m1 = nib_mask(sg >> 4);
+            acc = ggml_cuda_dp4a((int) grid_pos.x ^ m0, u0, acc);
+            acc = ggml_cuda_dp4a((int) grid_pos.y ^ m1, u1, acc);
+            acc -= ggml_cuda_dp4a(m1, u1, ggml_cuda_dp4a(m0, u0, 0));
+        } else {
+            const uint32_t signs = unpack_ksigns(q2[l0 / 2] >> 9);
+            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+            acc = ggml_cuda_dp4a((int) __vsub4(grid_pos.x ^ signs0, signs0), u0, acc);
+            acc = ggml_cuda_dp4a((int) __vsub4(grid_pos.y ^ signs1, signs1), u1, acc);
+        }
+    }
+    const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs / 2].ds);
+    return d * sumi;
+} };
+
+template<int SG> struct DotG<29, SG> { __device__ static __forceinline__ float f(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs,
+                                                      const uint32_t* grid_lut) {
+    const block_iq1_m* bq1 = (const block_iq1_m*) vbq + kbx;
+    const int qs_packed = get_int_b4(bq1->qs, iqs);
+    const uint8_t* qs = (const uint8_t*) &qs_packed;
+    int sumi[2] = {0, 0};
+    float sumf[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int qhl = bq1->qh[2 * iqs + l0 / 4] >> (4 * ((l0 / 2) % 2));
+        const int grid = (int) grid_lut[qs[l0 / 2] | ((qhl & 0x07) << 8)];
+        const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+        const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+        const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs].qs, l0 + 1);
+        sumi[l0 / 4] = ggml_cuda_dp4a(grid0, u0, sumi[l0 / 4]);
+        sumi[l0 / 4] = ggml_cuda_dp4a(grid1, u1, sumi[l0 / 4]);
+        const float delta = -1.0f + IQ1M_DELTA - (qhl & 0x08) * (2.0f * IQ1M_DELTA / 0x08);
+        int sumy = 0;
+        sumy = ggml_cuda_dp4a(u0, 0x01010101, sumy);
+        sumy = ggml_cuda_dp4a(u1, 0x01010101, sumy);
+        sumf[l0 / 4] += delta * sumy;
+    }
+    const uint16_t* sc = (const uint16_t*) bq1->scales;
+    iq1m_scale_t scale;
+    scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
+    const float d = __half2float(scale.f16) * __low2float(bq8_1[iqs].ds);
+    const int tmp = sc[iqs / 2] >> (6 * (iqs % 2));
+    const int sc0 = 2 * ((tmp >> 0) & 0x07) + 1;
+    const int sc1 = 2 * ((tmp >> 3) & 0x07) + 1;
+    return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
+} };
+
 template<int SG> struct DotG<23, SG> { __device__ static __forceinline__ float f(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs,
                                                       const uint32_t*) { return vec_dot_iq4_xs_q8_1(vbq, bq8_1, kbx, iqs); } };
 
@@ -5905,59 +5987,227 @@ __global__ void __launch_bounds__(256) native_gu_lds_kernel(const unsigned long 
     using F = Fmt<TG>;
     __shared__ GT sgrid[GridOf<TG>::N];
     extern __shared__ int sx_raw[];   // LDS_NT tokens x xb blocks of q8_1 (36 bytes = 9 ints each)
-    const int g = blockIdx.y;
-    if (g >= *n_groups) return;       // uniform over the block
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;   // uniform over the block
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const GT* gsrc = GridOf<TG>::src();
     for (int i = tid; i < GridOf<TG>::N; i += 256) sgrid[i] = gsrc[i];
-    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
     const int nb = (int) (L.n_embd / F::qk), xb = (int) (L.n_embd / 32);
-    const int e0 = grp_start[g], e1 = grp_start[g + 1];
     const int nrow = 2 * (int) L.n_ff;
     const block_q8_1* sx = (const block_q8_1*) sx_raw;
-    auto wrow = [&](int row) -> const uint8_t* {
-        const bool is_up = row >= L.n_ff;
-        return blob + (is_up ? L.up_off : 0) + (size_t) (is_up ? row - (int) L.n_ff : row) * L.gu_row;
-    };
     auto put = [&](int row, int e, float v) {
         const bool is_up = row >= L.n_ff;
         (is_up ? up : gate)[(size_t) e * L.n_ff + (is_up ? row - (int) L.n_ff : row)] = v;
     };
-    for (int c0 = e0; c0 < e1; c0 += LDS_NT) {
-        const int cn = min(LDS_NT, e1 - c0);
-        __syncthreads();
-        for (int j = 0; j < cn; ++j) {
-            const int* src = (const int*) (xq + (size_t) ent_tok[c0 + j] * xb);
-            for (int i = tid; i < xb * 9; i += 256) sx_raw[j * xb * 9 + i] = src[i];
+    for (int g = (int) blockIdx.y; g < ng; g += (int) gridDim.y) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        auto wrow = [&](int row) -> const uint8_t* {
+            const bool is_up = row >= L.n_ff;
+            return blob + (is_up ? L.up_off : 0) + (size_t) (is_up ? row - (int) L.n_ff : row) * L.gu_row;
+        };
+        for (int c0 = e0; c0 < e1; c0 += LDS_NT) {
+            const int cn = min(LDS_NT, e1 - c0);
+            __syncthreads();
+            for (int j = 0; j < cn; ++j) {
+                const int* src = (const int*) (xq + (size_t) ent_tok[c0 + j] * xb);
+                for (int i = tid; i < xb * 9; i += 256) sx_raw[j * xb * 9 + i] = src[i];
+            }
+            __syncthreads();
+            for (int p = 0; p < LDS_RB / 16; ++p) {
+                const int row0 = blockIdx.x * LDS_RB + p * 16 + warp, row1 = row0 + 8;
+                if (row0 >= nrow) break;
+                const bool two = row1 < nrow;
+                const uint8_t* w0 = wrow(row0);
+                const uint8_t* w1 = wrow(two ? row1 : row0);
+                if constexpr (TI) {   // mode 7: the tokens inside the k loop - one weight load per k for all of them
+                    auto pass = [&](auto ntc) {
+                        constexpr int NTC = decltype(ntc)::value;
+                        float s0[NTC], s1[NTC];
+#pragma unroll
+                        for (int j = 0; j < NTC; ++j) { s0[j] = 0.0f; s1[j] = 0.0f; }
+                        for (int k = lane; k < nb * F::ipb; k += 32) {
+                            const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+#pragma unroll
+                            for (int j = 0; j < NTC; ++j) {
+                                const block_q8_1* xk = sx + (size_t) j * xb + kbx * (F::qk / 32);
+                                const float a = DotG<TG, SG>::f(w0, xk, kbx, iqs, sgrid);
+                                const float b = DotG<TG, SG>::f(w1, xk, kbx, iqs, sgrid);
+                                s0[j] += a;
+                                s1[j] += b;
+                            }
+                        }
+#pragma unroll
+                        for (int j = 0; j < NTC; ++j) {
+                            const float a = warp_sum(s0[j]), b = warp_sum(s1[j]);
+                            if (lane == 0) { put(row0, c0 + j, a); if (two) put(row1, c0 + j, b); }
+                        }
+                    };
+                    switch (cn) {
+                        case 1: pass(std::integral_constant<int, 1>{}); break;
+                        case 2: pass(std::integral_constant<int, 2>{}); break;
+                        case 3: pass(std::integral_constant<int, 3>{}); break;
+                        default: pass(std::integral_constant<int, 4>{}); break;
+                    }
+                    continue;
+                }
+                for (int j = 0; j < cn; ++j) {
+                    const block_q8_1* x = sx + (size_t) j * xb;
+                    float s0 = 0.0f, s1 = 0.0f;
+                    for (int k = lane; k < nb * F::ipb; k += 32) {
+                        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                        const block_q8_1* xk = x + kbx * (F::qk / 32);
+                        const float a = DotG<TG, SG>::f(w0, xk, kbx, iqs, sgrid);
+                        const float b = DotG<TG, SG>::f(w1, xk, kbx, iqs, sgrid);
+                        s0 += a;
+                        s1 += b;
+                    }
+                    s0 = warp_sum(s0);
+                    s1 = warp_sum(s1);
+                    if (lane == 0) { put(row0, c0 + j, s0); if (two) put(row1, c0 + j, s1); }
+                }
+            }
         }
-        __syncthreads();
-        for (int p = 0; p < LDS_RB / 16; ++p) {
-            const int row0 = blockIdx.x * LDS_RB + p * 16 + warp, row1 = row0 + 8;
-            if (row0 >= nrow) break;
-            const bool two = row1 < nrow;
-            const uint8_t* w0 = wrow(row0);
-            const uint8_t* w1 = wrow(two ? row1 : row0);
-            if constexpr (TI) {   // mode 7: the tokens inside the k loop - one weight load per k for all of them
+    }
+}
+
+struct Q20ActBlock {
+    int u_plane[8];
+    int sum_u;
+    float d8;
+    int pad;
+};
+static_assert(sizeof(Q20ActBlock) == 44, "11-dword bank-conflict-free Q2_0 LDS block");
+
+__device__ __forceinline__ Q20ActBlock make_q20_act_block(const block_q8_1& b) {
+    Q20ActBlock r;
+    const int u0 = get_int_b4(b.qs, 0), u1 = get_int_b4(b.qs, 1), u2 = get_int_b4(b.qs, 2), u3 = get_int_b4(b.qs, 3);
+    const int u4 = get_int_b4(b.qs, 4), u5 = get_int_b4(b.qs, 5), u6 = get_int_b4(b.qs, 6), u7 = get_int_b4(b.qs, 7);
+    const int t01_lo = (int) __byte_perm(u0, u1, 0x5140), t01_hi = (int) __byte_perm(u0, u1, 0x7362);
+    const int t23_lo = (int) __byte_perm(u2, u3, 0x5140), t23_hi = (int) __byte_perm(u2, u3, 0x7362);
+    r.u_plane[0] = (int) __byte_perm(t01_lo, t23_lo, 0x5410);
+    r.u_plane[1] = (int) __byte_perm(t01_lo, t23_lo, 0x7632);
+    r.u_plane[2] = (int) __byte_perm(t01_hi, t23_hi, 0x5410);
+    r.u_plane[3] = (int) __byte_perm(t01_hi, t23_hi, 0x7632);
+    const int t45_lo = (int) __byte_perm(u4, u5, 0x5140), t45_hi = (int) __byte_perm(u4, u5, 0x7362);
+    const int t67_lo = (int) __byte_perm(u6, u7, 0x5140), t67_hi = (int) __byte_perm(u6, u7, 0x7362);
+    r.u_plane[4] = (int) __byte_perm(t45_lo, t67_lo, 0x5410);
+    r.u_plane[5] = (int) __byte_perm(t45_lo, t67_lo, 0x7632);
+    r.u_plane[6] = (int) __byte_perm(t45_hi, t67_hi, 0x5410);
+    r.u_plane[7] = (int) __byte_perm(t45_hi, t67_hi, 0x7632);
+    int su = 0;
+    su = ggml_cuda_dp4a(u0, 0x01010101, su);
+    su = ggml_cuda_dp4a(u1, 0x01010101, su);
+    su = ggml_cuda_dp4a(u2, 0x01010101, su);
+    su = ggml_cuda_dp4a(u3, 0x01010101, su);
+    su = ggml_cuda_dp4a(u4, 0x01010101, su);
+    su = ggml_cuda_dp4a(u5, 0x01010101, su);
+    su = ggml_cuda_dp4a(u6, 0x01010101, su);
+    su = ggml_cuda_dp4a(u7, 0x01010101, su);
+    r.sum_u = su;
+    r.d8 = __low2float(b.ds);
+    r.pad = 0;
+    return r;
+}
+
+// ---- 7 (down): the group's q8_1 h rows in LDS, the tokens inside the k loop, the R2 row pairs of mode 2 -
+// the same per-(row, entry) sums in the same order: bitwise the mode-2 output.
+template<int TD, bool Q20_T = false>
+__global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                              const int32_t* __restrict__ grp_start,
+                                                              const int32_t* __restrict__ n_groups,
+                                                              const int32_t* __restrict__ ent_dst,
+                                                              const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+                                                              float* __restrict__ out) {
+    using F = Fmt<TD>;
+    extern __shared__ int sh_raw[];   // LDS_NT entries x hb blocks of q8_1 (or Q20ActBlock when Q20_T)
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int nb = (int) (L.n_ff / F::qk), hb = (int) (L.n_ff / 32);
+    const int nrow = (int) L.n_embd;
+    const block_q8_1* sh = (const block_q8_1*) sh_raw;
+    for (int g = (int) blockIdx.y; g < ng; g += (int) gridDim.y) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int c0 = e0; c0 < e1; c0 += LDS_NT) {
+            const int cn = min(LDS_NT, e1 - c0);
+            __syncthreads();
+            if constexpr (TD == 42 && Q20_T) {
+                Q20ActBlock* sh_t = (Q20ActBlock*) sh_raw;
+                const block_q8_1* src = hq + (size_t) c0 * hb;
+                for (int i = tid; i < cn * hb; i += 256) sh_t[i] = make_q20_act_block(src[i]);
+            } else {
+                const int* src = (const int*) (hq + (size_t) c0 * hb);   // the chunk's entries are contiguous
+                for (int i = tid; i < cn * hb * 9; i += 256) sh_raw[i] = src[i];
+            }
+            __syncthreads();
+            for (int p = 0; p < LDS_RB / 16; ++p) {
+                const int r0 = blockIdx.x * LDS_RB + p * 16 + warp, r1 = r0 + 8;
+                if (r0 >= nrow) break;
+                const bool two = r1 < nrow;
+                const uint8_t* w0 = blob + L.down_off + (size_t) r0 * L.d_row;
+                const uint8_t* w1 = blob + L.down_off + (size_t) (two ? r1 : r0) * L.d_row;
                 auto pass = [&](auto ntc) {
                     constexpr int NTC = decltype(ntc)::value;
                     float s0[NTC], s1[NTC];
 #pragma unroll
                     for (int j = 0; j < NTC; ++j) { s0[j] = 0.0f; s1[j] = 0.0f; }
-                    for (int k = lane; k < nb * F::ipb; k += 32) {
-                        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                    if constexpr (TD == 42 && Q20_T) {
+                        const Q20ActBlock* sh_t = (const Q20ActBlock*) sh_raw;
+                        for (int k = lane; k < nb * F::ipb; k += 32) {
+                            const int kbx = k / F::ipb, iqs = k % F::ipb;
+                            const block_q2_0* b0 = (const block_q2_0*) w0 + kbx;
+                            const block_q2_0* b1 = (const block_q2_0*) w1 + kbx;
+                            const float d2_0 = b0->d, d2_1 = b1->d;
+                            const uint32_t wl0 = (uint32_t) get_int_b2(b0->qs, 2 * iqs + 0);
+                            const uint32_t wh0 = (uint32_t) get_int_b2(b0->qs, 2 * iqs + 1);
+                            const uint32_t wl1 = (uint32_t) get_int_b2(b1->qs, 2 * iqs + 0);
+                            const uint32_t wh1 = (uint32_t) get_int_b2(b1->qs, 2 * iqs + 1);
+                            int q0[8], q1[8];
 #pragma unroll
-                        for (int j = 0; j < NTC; ++j) {
-                            const block_q8_1* xk = sx + (size_t) j * xb + kbx * (F::qk / 32);
-                            const float a = DotG<TG, SG>::f(w0, xk, kbx, iqs, sgrid);
-                            const float b = DotG<TG, SG>::f(w1, xk, kbx, iqs, sgrid);
-                            s0[j] += a;
-                            s1[j] += b;
+                            for (int s = 0; s < 4; ++s) {
+                                q0[s]     = (int) ((wl0 >> (2 * s)) & 0x03030303u);
+                                q0[4 + s] = (int) ((wh0 >> (2 * s)) & 0x03030303u);
+                                q1[s]     = (int) ((wl1 >> (2 * s)) & 0x03030303u);
+                                q1[4 + s] = (int) ((wh1 >> (2 * s)) & 0x03030303u);
+                            }
+#pragma unroll
+                            for (int j = 0; j < NTC; ++j) {
+                                const Q20ActBlock& xk = sh_t[(size_t) j * hb + k];
+                                int si0 = -xk.sum_u, si1 = -xk.sum_u;
+#pragma unroll
+                                for (int p8 = 0; p8 < 8; ++p8) {
+                                    const int up = xk.u_plane[p8];
+                                    si0 = ggml_cuda_dp4a(up, q0[p8], si0);
+                                    si1 = ggml_cuda_dp4a(up, q1[p8], si1);
+                                }
+                                const float a = d2_0 * xk.d8 * si0;
+                                const float b = d2_1 * xk.d8 * si1;
+                                s0[j] += a;
+                                s1[j] += b;
+                            }
+                        }
+                    } else {
+                        for (int k = lane; k < nb * F::ipb; k += 32) {
+                            const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+#pragma unroll
+                            for (int j = 0; j < NTC; ++j) {
+                                const block_q8_1* xk = sh + (size_t) j * hb + kbx * (F::qk / 32);
+                                const float a = F::dot(w0, xk, kbx, iqs);
+                                const float b = F::dot(w1, xk, kbx, iqs);
+                                s0[j] += a;
+                                s1[j] += b;
+                            }
                         }
                     }
 #pragma unroll
                     for (int j = 0; j < NTC; ++j) {
                         const float a = warp_sum(s0[j]), b = warp_sum(s1[j]);
-                        if (lane == 0) { put(row0, c0 + j, a); if (two) put(row1, c0 + j, b); }
+                        if (lane == 0) {
+                            out[(size_t) ent_dst[c0 + j] * L.n_embd + r0] = a;
+                            if (two) out[(size_t) ent_dst[c0 + j] * L.n_embd + r1] = b;
+                        }
                     }
                 };
                 switch (cn) {
@@ -5966,90 +6216,6 @@ __global__ void __launch_bounds__(256) native_gu_lds_kernel(const unsigned long 
                     case 3: pass(std::integral_constant<int, 3>{}); break;
                     default: pass(std::integral_constant<int, 4>{}); break;
                 }
-                continue;
-            }
-            for (int j = 0; j < cn; ++j) {
-                const block_q8_1* x = sx + (size_t) j * xb;
-                float s0 = 0.0f, s1 = 0.0f;
-                for (int k = lane; k < nb * F::ipb; k += 32) {
-                    const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
-                    const block_q8_1* xk = x + kbx * (F::qk / 32);
-                    const float a = DotG<TG, SG>::f(w0, xk, kbx, iqs, sgrid);
-                    const float b = DotG<TG, SG>::f(w1, xk, kbx, iqs, sgrid);
-                    s0 += a;
-                    s1 += b;
-                }
-                s0 = warp_sum(s0);
-                s1 = warp_sum(s1);
-                if (lane == 0) { put(row0, c0 + j, s0); if (two) put(row1, c0 + j, s1); }
-            }
-        }
-    }
-}
-
-// ---- 7 (down): the group's q8_1 h rows in LDS, the tokens inside the k loop, the R2 row pairs of mode 2 -
-// the same per-(row, entry) sums in the same order: bitwise the mode-2 output.
-template<int TD>
-__global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned long long* __restrict__ grp_ptr,
-                                                              const int32_t* __restrict__ grp_start,
-                                                              const int32_t* __restrict__ n_groups,
-                                                              const int32_t* __restrict__ ent_dst,
-                                                              const block_q8_1* __restrict__ hq, NativeExpertLayout L,
-                                                              float* __restrict__ out) {
-    using F = Fmt<TD>;
-    extern __shared__ int sh_raw[];   // LDS_NT entries x hb blocks of q8_1
-    const int g = blockIdx.y;
-    if (g >= *n_groups) return;
-    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
-    const int nb = (int) (L.n_ff / F::qk), hb = (int) (L.n_ff / 32);
-    const int e0 = grp_start[g], e1 = grp_start[g + 1];
-    const int nrow = (int) L.n_embd;
-    const block_q8_1* sh = (const block_q8_1*) sh_raw;
-    for (int c0 = e0; c0 < e1; c0 += LDS_NT) {
-        const int cn = min(LDS_NT, e1 - c0);
-        __syncthreads();
-        {
-            const int* src = (const int*) (hq + (size_t) c0 * hb);   // the chunk's entries are contiguous
-            for (int i = tid; i < cn * hb * 9; i += 256) sh_raw[i] = src[i];
-        }
-        __syncthreads();
-        for (int p = 0; p < LDS_RB / 16; ++p) {
-            const int r0 = blockIdx.x * LDS_RB + p * 16 + warp, r1 = r0 + 8;
-            if (r0 >= nrow) break;
-            const bool two = r1 < nrow;
-            const uint8_t* w0 = blob + L.down_off + (size_t) r0 * L.d_row;
-            const uint8_t* w1 = blob + L.down_off + (size_t) (two ? r1 : r0) * L.d_row;
-            auto pass = [&](auto ntc) {
-                constexpr int NTC = decltype(ntc)::value;
-                float s0[NTC], s1[NTC];
-#pragma unroll
-                for (int j = 0; j < NTC; ++j) { s0[j] = 0.0f; s1[j] = 0.0f; }
-                for (int k = lane; k < nb * F::ipb; k += 32) {
-                    const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
-#pragma unroll
-                    for (int j = 0; j < NTC; ++j) {
-                        const block_q8_1* xk = sh + (size_t) j * hb + kbx * (F::qk / 32);
-                        const float a = F::dot(w0, xk, kbx, iqs);
-                        const float b = F::dot(w1, xk, kbx, iqs);
-                        s0[j] += a;
-                        s1[j] += b;
-                    }
-                }
-#pragma unroll
-                for (int j = 0; j < NTC; ++j) {
-                    const float a = warp_sum(s0[j]), b = warp_sum(s1[j]);
-                    if (lane == 0) {
-                        out[(size_t) ent_dst[c0 + j] * L.n_embd + r0] = a;
-                        if (two) out[(size_t) ent_dst[c0 + j] * L.n_embd + r1] = b;
-                    }
-                }
-            };
-            switch (cn) {
-                case 1: pass(std::integral_constant<int, 1>{}); break;
-                case 2: pass(std::integral_constant<int, 2>{}); break;
-                case 3: pass(std::integral_constant<int, 3>{}); break;
-                default: pass(std::integral_constant<int, 4>{}); break;
             }
         }
     }
@@ -6071,77 +6237,103 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
     __shared__ GT sgrid[GridOf<TG>::N];
     __shared__ float res[LDS_NT][64];
     extern __shared__ int sx_raw[];
-    const int g = blockIdx.y;
-    if (g >= *n_groups) return;
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const GT* gsrc = GridOf<TG>::src();
     for (int i = tid; i < GridOf<TG>::N; i += 256) sgrid[i] = gsrc[i];
-    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
     const int nb = (int) (L.n_embd / F::qk), xb = (int) (L.n_embd / 32), hb = (int) (L.n_ff / 32);
-    const int e0 = grp_start[g], e1 = grp_start[g + 1];
     const int r0 = blockIdx.x * 32;
     const block_q8_1* sx = (const block_q8_1*) sx_raw;
-    auto wrow = [&](int i) -> const uint8_t* {   // i < 32: gate row r0 + i, else up row r0 + i - 32
-        return blob + (i < 32 ? (size_t) 0 : L.up_off) + (size_t) (r0 + (i & 31)) * L.gu_row;
-    };
-    for (int c0 = e0; c0 < e1; c0 += LDS_NT) {
-        const int cn = min(LDS_NT, e1 - c0);
-        __syncthreads();
-        for (int j = 0; j < cn; ++j) {
-            const int* src = (const int*) (xq + (size_t) ent_tok[c0 + j] * xb);
-            for (int i = tid; i < xb * 9; i += 256) sx_raw[j * xb * 9 + i] = src[i];
-        }
-        __syncthreads();
-        for (int p = 0; p < 4; ++p) {
-            const int i0 = p * 16 + warp, i1 = i0 + 8;
-            const uint8_t* w0 = wrow(i0);
-            const uint8_t* w1 = wrow(i1);
-            auto pass = [&](auto ntc) {
-                constexpr int NTC = decltype(ntc)::value;
-                float s0[NTC], s1[NTC];
+    for (int g = (int) blockIdx.y; g < ng; g += (int) gridDim.y) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        auto wrow = [&](int i) -> const uint8_t* {   // i < 32: gate row r0 + i, else up row r0 + i - 32
+            return blob + (i < 32 ? (size_t) 0 : L.up_off) + (size_t) (r0 + (i & 31)) * L.gu_row;
+        };
+        for (int c0 = e0; c0 < e1; c0 += LDS_NT) {
+            const int cn = min(LDS_NT, e1 - c0);
+            __syncthreads();
+            for (int j = 0; j < cn; ++j) {
+                const int* src = (const int*) (xq + (size_t) ent_tok[c0 + j] * xb);
+                for (int i = tid; i < xb * 9; i += 256) sx_raw[j * xb * 9 + i] = src[i];
+            }
+            __syncthreads();
+            for (int p = 0; p < 4; ++p) {
+                const int i0 = p * 16 + warp, i1 = i0 + 8;
+                const uint8_t* w0 = wrow(i0);
+                const uint8_t* w1 = wrow(i1);
+                auto pass = [&](auto ntc) {
+                    constexpr int NTC = decltype(ntc)::value;
+                    float s0[NTC], s1[NTC];
 #pragma unroll
-                for (int j = 0; j < NTC; ++j) { s0[j] = 0.0f; s1[j] = 0.0f; }
-                for (int k = lane; k < nb * F::ipb; k += 32) {
-                    const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                    for (int j = 0; j < NTC; ++j) { s0[j] = 0.0f; s1[j] = 0.0f; }
+                    for (int k = lane; k < nb * F::ipb; k += 32) {
+                        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+#pragma unroll
+                        for (int j = 0; j < NTC; ++j) {
+                            const block_q8_1* xk = sx + (size_t) j * xb + kbx * (F::qk / 32);
+                            const float a = DotG<TG, 1>::f(w0, xk, kbx, iqs, sgrid);
+                            const float b = DotG<TG, 1>::f(w1, xk, kbx, iqs, sgrid);
+                            s0[j] += a;
+                            s1[j] += b;
+                        }
+                    }
 #pragma unroll
                     for (int j = 0; j < NTC; ++j) {
-                        const block_q8_1* xk = sx + (size_t) j * xb + kbx * (F::qk / 32);
-                        const float a = DotG<TG, 1>::f(w0, xk, kbx, iqs, sgrid);
-                        const float b = DotG<TG, 1>::f(w1, xk, kbx, iqs, sgrid);
-                        s0[j] += a;
-                        s1[j] += b;
+                        const float a = warp_sum(s0[j]), b = warp_sum(s1[j]);
+                        if (lane == 0) { res[j][i0] = a; res[j][i1] = b; }
                     }
+                };
+                switch (cn) {
+                    case 1: pass(std::integral_constant<int, 1>{}); break;
+                    case 2: pass(std::integral_constant<int, 2>{}); break;
+                    case 3: pass(std::integral_constant<int, 3>{}); break;
+                    default: pass(std::integral_constant<int, 4>{}); break;
                 }
-#pragma unroll
-                for (int j = 0; j < NTC; ++j) {
-                    const float a = warp_sum(s0[j]), b = warp_sum(s1[j]);
-                    if (lane == 0) { res[j][i0] = a; res[j][i1] = b; }
+            }
+            __syncthreads();
+            if (warp < cn) {   // swiglu_entries_kernel + quantize_q8_1_kernel, one block of 32 h values per entry
+                const float gg = res[warp][lane], uu = res[warp][32 + lane];
+                const float xi = (gg / (1.0f + __expf(-gg))) * uu;
+                float amax = fabsf(xi), sum = warp_sum(xi);
+#if defined(__gfx906__)
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 16));
+                amax = fmaxf(amax, __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(amax), 0x128, 0xf, 0xf, false)));
+                {
+                    const int x = __float_as_int(amax);
+                    int r = __builtin_amdgcn_update_dpp(0, x, 0x104, 0xf, 0x5, false);
+                    r = __builtin_amdgcn_update_dpp(r, x, 0x114, 0xf, 0xa, false);
+                    amax = fmaxf(amax, __int_as_float(r));
                 }
-            };
-            switch (cn) {
-                case 1: pass(std::integral_constant<int, 1>{}); break;
-                case 2: pass(std::integral_constant<int, 2>{}); break;
-                case 3: pass(std::integral_constant<int, 3>{}); break;
-                default: pass(std::integral_constant<int, 4>{}); break;
-            }
-        }
-        __syncthreads();
-        if (warp < cn) {   // swiglu_entries_kernel + quantize_q8_1_kernel, one block of 32 h values per entry
-            const float gg = res[warp][lane], uu = res[warp][32 + lane];
-            const float xi = (gg / (1.0f + __expf(-gg))) * uu;
-            float amax = fabsf(xi), sum = xi;
+                amax = fmaxf(amax, __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(amax), 0x04e, 0xf, 0xf, false)));
+                amax = fmaxf(amax, __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(amax), 0x0b1, 0xf, 0xf, false)));
+#else
 #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) {
-                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-                sum += __shfl_xor_sync(0xffffffffu, sum, o);
+                for (int o = 16; o > 0; o >>= 1) {
+                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+                }
+#endif
+                const float d = q8_1_finite(amax / 127.0f);   // #606, as q8_1_store: finite blocks bit for bit
+                const int8_t q = q8_1_quant(xi, d, amax);
+                block_q8_1* y = hq + (size_t) (c0 + warp) * hb + blockIdx.x;
+                y->qs[lane] = q;
+                if (lane == 0) y->ds = q8_1_ds(d, sum);
             }
-            const float d = q8_1_finite(amax / 127.0f);   // #606, as q8_1_store: finite blocks bit for bit
-            const int8_t q = q8_1_quant(xi, d, amax);
-            block_q8_1* y = hq + (size_t) (c0 + warp) * hb + blockIdx.x;
-            y->qs[lane] = q;
-            if (lane == 0) y->ds = q8_1_ds(d, sum);
         }
     }
+}
+
+bool exp_lds16() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_GFX906_LDS16");
+        return v ? (std::atoi(v) != 0) : kExpLds16;
+    }();
+    return on;
+}
+bool q20_lds_t_on() {
+    static const bool on = !env_on("STRATA_NO_GFX906_Q20_LDS_T");
+    return on;
 }
 
 // dflash2-kern: Strix Halo (gfx1151) takes mode 8 (gate/up + SwiGLU + q8_1 in one launch, the group's activations in LDS) for the
@@ -6368,16 +6560,20 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
 #endif
 #if STRATA_EXP_LAYOUTS
-    const bool fused_gu = !nib_layout(L) && em0 == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23) &&
+    const bool gu_lds_type = (exp_lds16() && L.gu_type == 16) || L.gu_type == 17 || L.gu_type == 18 ||
+                             L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23 || L.gu_type == 29;
+    const bool fused_gu = !nib_layout(L) && L.had_block <= 0 && em0 == 8 && gu_lds_type &&
                           L.n_ff % 32 == 0;
     if (fused_gu && g_exp_phase != 2) {
-        const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
+        const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) gy);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
         switch (L.gu_type) {
             case 16: native_gu_fused_kernel<16><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 17: native_gu_fused_kernel<17><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 18: native_gu_fused_kernel<18><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 21: native_gu_fused_kernel<21><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 23: native_gu_fused_kernel<23><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 29: native_gu_fused_kernel<29><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             default: native_gu_fused_kernel<22><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
         }
         check("native_expert_grouped/gu fused");
@@ -6413,15 +6609,17 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     if (g_exp_phase != 2 && !gs_done) {
 #endif
 #if STRATA_EXP_LAYOUTS
-    const bool lds_gu = !nib_layout(L) && (em0 == 5 || em0 == 6 || em0 == 7 || em0 == 8) && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23);
+    const bool lds_gu = !nib_layout(L) && (em0 == 5 || em0 == 6 || em0 == 7 || em0 == 8) && gu_lds_type;
     if (lds_gu) {
-        const dim3 gl((unsigned) ((2 * L.n_ff + LDS_RB - 1) / LDS_RB), (unsigned) cap_groups);
+        const dim3 gl((unsigned) ((2 * L.n_ff + LDS_RB - 1) / LDS_RB), (unsigned) gy);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
         switch (L.gu_type) {
             case 16: if (em0 >= 7) native_gu_lds_kernel<16, 1, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else if (em0 == 6) native_gu_lds_kernel<16, 1><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else native_gu_lds_kernel<16, 0><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+            case 17: if (em0 >= 7) native_gu_lds_kernel<17, 1, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else if (em0 == 6) native_gu_lds_kernel<17, 1><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else native_gu_lds_kernel<17, 0><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
             case 18: if (em0 >= 7) native_gu_lds_kernel<18, 1, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else if (em0 == 6) native_gu_lds_kernel<18, 1><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else native_gu_lds_kernel<18, 0><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
             case 21: if (em0 >= 7) native_gu_lds_kernel<21, 1, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else if (em0 == 6) native_gu_lds_kernel<21, 1><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else native_gu_lds_kernel<21, 0><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
             case 23: if (em0 >= 7) native_gu_lds_kernel<23, 1, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else native_gu_lds_kernel<23, 1><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+            case 29: if (em0 >= 7) native_gu_lds_kernel<29, 1, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else if (em0 == 6) native_gu_lds_kernel<29, 1><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else native_gu_lds_kernel<29, 0><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
             default: if (em0 >= 7) native_gu_lds_kernel<22, 1, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else if (em0 == 6) native_gu_lds_kernel<22, 1><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else native_gu_lds_kernel<22, 0><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         }
     } else {
@@ -6500,10 +6698,17 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     // gfx1151: the LDS down kernel is slower than the CUDA layout for IQ4_NL (86 vs 63 us, 24 groups) and faster for Q2_0 (-18%)
     const bool lds_down_ok = L.d_type == 42 || (L.d_type == 20 && !gfx1151_exp8(dev_d));
     if ((em0d == 7 || em0d == 8) && lds_down_ok) {
-        const dim3 gl((unsigned) ((L.n_embd + LDS_RB - 1) / LDS_RB), (unsigned) cap_groups);
-        const size_t sh = (size_t) LDS_NT * (size_t) (L.n_ff / 32) * sizeof(block_q8_1);
-        if (L.d_type == 20) native_down_lds_kernel<20><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
-        else native_down_lds_kernel<42><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        const dim3 gl((unsigned) ((L.n_embd + LDS_RB - 1) / LDS_RB), (unsigned) gy);
+        if (L.d_type == 20) {
+            const size_t sh = (size_t) LDS_NT * (size_t) (L.n_ff / 32) * sizeof(block_q8_1);
+            native_down_lds_kernel<20><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        } else if (q20_lds_t_on()) {
+            const size_t sh = (size_t) LDS_NT * (size_t) (L.n_ff / 32) * sizeof(Q20ActBlock);
+            native_down_lds_kernel<42, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        } else {
+            const size_t sh = (size_t) LDS_NT * (size_t) (L.n_ff / 32) * sizeof(block_q8_1);
+            native_down_lds_kernel<42, false><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        }
         check("native_expert_grouped/down");
         return;
     }
