@@ -1,4 +1,105 @@
 <p align="center">
+  <b>English (README.md)</b> · <a href="README.zh-CN.md"><b>简体中文 (README.zh-CN.md)</b></a>
+</p>
+
+> [!IMPORTANT]
+> **Experimental Hardware-Limit Optimization Fork (`gfx906` Vega 20 + `Broadwell` AVX2)**
+>
+> This repository is an **experimental research & kernel-optimization fork** of **[Niko1221/Strata](https://github.com/Niko1221/Strata)** dedicated to extracting the absolute physical ceiling of an **≈1,500 CNY (≈\$207 USD) legacy workstation** (`Intel Xeon E5-2686 v4` + `64 GB DDR3-1866 ECC` + dual-fan modded `AMD Instinct MI50 16GB HBM2`) running the **125B-class sparse MoE model `Qwen3.8-Flash-Next` (`GSQ-RCO-IQ2_XS`)** all the way up to **256K (`262,144`) multi-turn Agent context**.
+>
+> For official releases, desktop installers, and general multi-GPU/multi-vendor support, please use the upstream repository: **[github.com/Niko1221/Strata](https://github.com/Niko1221/Strata)**.
+
+---
+
+## Experimental Platform & Benchmark Showcase (≈1,500 CNY / ≈\$207 Rig)
+
+### 1. Detailed Hardware, Firmware & System Specifications
+
+| Component | Exact Specification & Tuning State |
+| :--- | :--- |
+| **Total Build Cost** | **≈1,500 CNY (≈\$207 USD)** (secondary-market X99 + Vega 20 compute build) |
+| **CPU** | **Intel Xeon E5-2686 v4** (14nm Broadwell-EP, **18 Cores / 36 Threads**, `3.00 GHz` sustained all-core AVX2 + FMA3 under `performance` governor, `45 MiB` 20-way L3 cache with `/sys/fs/resctrl` CAT, single-socket NUMA node 0) |
+| **System RAM** | **64 GB (`4 × 16 GB`) Quad-Channel DDR3-1866 ECC Registered** (`59.7 GB/s` theoretical peak; `33.02 GiB` sparse expert arena zero-copy pinned via `Transparent Huge Pages [always]` + `cudaHostRegister(PORTABLE)`) |
+| **GPU** | **AMD Instinct MI50 16GB HBM2** flashed with **AMD Radeon Pro VII** vBIOS (`Vega 20` / `gfx906:sramecc+:xnack-`, 7nm, **60 CUs / 3,840 SPs**, Wave64, `64 KiB` LDS/CU, **NO Matrix / Tensor Cores**, native `v_dot4_i32_i8` + `26.8 TFLOPS` FP16 + 1-cycle VALU DPP; `16 GiB` 4096-bit HBM2 locked at **`1000 MHz` = `1,024 GB/s`**, `15.957 GiB` usable VRAM with AST BMC headless display) |
+| **Thermal Mod** | Custom dual-fan shroud mod + `hwmon` PWM daemon (`strata-mi50-guard`): holds **`32–46 °C` edge / `42–60 °C` HBM2 / `47–84 °C` junction** across 25+ minutes of continuous 256K full-load prefill (`118.4 W` mean, zero thermal throttling) |
+| **PCIe Interconnect** | **PCIe 3.0 x16** (`iommu=pt` passthrough, `setpci` unlocked **`MaxReadReq = 4096 Bytes`** from BIOS `256B`, ASPM L1 disabled) → **`13.3 GB/s` sustained H2D pinned DMA** |
+| **NVMe Storage** | PCIe NVMe SSD streaming the `26.8 GiB` (`320M`-row) Per-Layer Embedding (PLE) n-gram shard via unbuffered `O_DIRECT` at **`38,069 rows/s`** |
+| **OS & Compiler** | Ubuntu 24.04 LTS (Linux 6.8, `ulimit -l unlimited`, `vm.swappiness=1`), host-extracted native **`rocm-gfx906:7.14`** (`AMD clang 23.0.0git +PATCHED`, `rocBLAS 5.5.0.cd957402309`, `-O3 -march=broadwell -mtune=broadwell`, `CMAKE_HIP_ARCHITECTURES=gfx906`) |
+| **Evaluated Model** | **ISTA-DASLab `Qwen3.8-Flash-Next` (`GSQ-RCO-IQ2_XS`)** (≈125B sparse MoE, 512 experts top-10, 36 GDN linear-recurrence + 12 QSA sparse block-attention layers, `36.5 GiB` Shard 1 + `26.8 GiB` PLE Shard 2 + `952 MiB` MTP speculative drafter, native `262,144` trained context) |
+
+---
+
+### 2. End-to-End Performance Scorecard (Upstream Baseline vs. Optimized Fork)
+
+Prompt processing (`Prefill`), pure speculative generation (`Decode`), prefix-cached incremental latency (`TTFT`), and suffix-assisted edit generation are reported separately:
+
+| Workload (`Qwen3.8-Flash-Next` `IQ2_XS` + MTP `--spec 4`) | Frozen Upstream (`S0_Baseline`) | Optimized Fork (`Throughput_Max`) | Measured Gain | Verification & Notes |
+| :--- | :---: | :---: | :---: | :--- |
+| **Interactive Chat / Code Decode (Median)** | `36.60 tok/s` | **`45.60 tok/s`** | **`+24.6%`** | 3-round counter-balanced confirmation (9 runs) |
+| **Code Generation Decode (Peak)** | `48.80 tok/s` | **`57.00 tok/s`** (`55+` sustained) | **`+16.8%`** | High MTP 4-token acceptance on structured code |
+| **Zero-Skip Exact Mode (`Exact_Max`, `TAIL_SKIP=0`)** | `35.80 tok/s` (`E0`) | **`46.20 tok/s`** (`45.27` mean) | **`+29.1%`** | CLI 128-token greedy **100% bitwise identical** |
+| **4K Context Prompt Prefill (Cold / Warm)** | `308.30 tok/s` | **`426.50` / `455.20 tok/s`** | **`+38.3%` / `+48.2%`** | `463.60 tok/s` (`+50.4%`) with `STRATA_PA_FAST=1` |
+| **4K Context Long Decode (Cold / Warm)** | `35.50 tok/s` | **`40.10` / `43.30 tok/s`** | **`+13.0%` / `+22.0%`** | `Exact_Max` 4K Decode: **`40.40 tok/s`** (`+28.3%` vs `E0`) |
+| **32K Context (`27,773` tok, `int8` KV)** | Prefill `345.7` / Decode `43.9` | **Prefill `523.3` / Decode `47.3 tok/s`** | **Prefill `+51.4%`** | Saves `27.3 s` per 28K prompt; 100% needle hit |
+| **64K Context (`64,412` tok, `k8v4` KV)** | — | **Prefill `519.0` / Decode `43.8 tok/s`** | `124.1 s` for `64.4K` tok | 100% needle hit; `6,707` resident VRAM expert slots |
+| **128K Full Cold Agent Repo (`127,949` tok, `k8v4`)** | — | **Prefill `484.3` / Decode `38.9 tok/s`** | `264.2 s` for `128K` tok | 2/2 needles (`19.1K` & `108.2K`) retrieved verbatim |
+| **256K Extreme Agent Cold (`251,964–255,693` tok)** | — | **Prefill `444.9` / `<think>`+Tool `41.5 tok/s`** | **97.5% of 256K on 16GB** | **3/3 needles (`12.4K / 125.4K / 238.7K`) + JSON Tool Call** |
+| **256K Multi-Turn Prefix-Cached (`255,042` tok)** | — | **TTFT `9.63 s` / Edit+Code `54.8 tok/s`** | **`58.8x` faster Turn-2 TTFT** | `252,163` cached + `2,619` fresh TSan log tokens |
+| **248,320 Full-Vocab FP64 Forward KL Divergence** | `0.009351` | **`0.009299` (`5/5` Top-1 match)** | **Lower KL than baseline** | `Exact_Max` mean KL: **`0.000563`** (vs `E0_Golden_Exact`) |
+
+---
+
+### 3. Step-by-Step Optimization Breakdown (What Each Layer Delivered)
+
+1. **Step 0 — Host DMA, THP Zero-Copy Pinning & Dual-Fan HBM2 Lock**
+   - Unlocked PCIe `MaxReadReq=4096B` + `iommu=pt` (`13.3 GB/s` sustained H2D DMA), pinned the `33.02 GiB` expert arena with `THP [always]`, trimmed idle VRAM footprint to `27 MiB`, and locked MI50 HBM2 at `1000 MHz` (`1,024 GB/s`).
+2. **Step 1 & 2 — Custom Vega 20 (`gfx906`) GCN Kernels & Broadwell AVX2 Bitplane Kernels (Zero Flags, 100% Bit-Identical)**
+   - **Fused MoE Experts (`src/kernels/cuda/iq_kernels.cu`)**: Enabled single-launch Mode-8 (`Gate+Up+SwiGLU+Q8_1`) across `IQ2_S / IQ2_XXS / IQ1_M`, designed an **11-dword conflict-free LDS bitplane transpose** (`gcd(11,32)=1`) for `Q2_0` down-projection, halved `v_dot4_i32_i8` instructions (`16 → 8`) via branchless two's-complement `nib_neg4`, hoisted multi-token `DecG` lookups, and shrank LDS dynamically (`LNT=1/2/4`, `20.7 KB → 11.3 KB`) to jump from **3 to 5 resident blocks/CU** (300 blocks single-wave across 60 CUs). Real-weight 48-layer MoE sped up **`1.48x` (`T=1`)** and **`1.56x` (`T=3` MTP; `IQ2_XXS` `2.65x`)**, boosting `--serve` exact 4K decode by **`+27.3%`** (`31.5 → 40.1 tok/s`) before touching a single config knob.
+   - **Router, BF16/Quant GEMV & 248K Vocab Verify (`native_bf16.cu`, `native_router.cu`, `native_mmvq.cu`, `s26_tsum.cuh`, `verify_kernels.cu`)**: Eliminated 512-CTA wave-tail thrashing on 60 CUs via 128-CTA 4-row tiles (`4.35x–5.67x` faster `[512][2560]` router GEMV; **`3.05x` faster 48-layer routing chain**), replaced 67%–80% of `ds_bpermute_b32` LDS shuffles with 1-cycle hardware VALU DPP (`row_shl` / `quad_perm`), and parallelized Wave64 248K-vocab `argmax_rows` (**`7.84x` faster**).
+   - **Broadwell AVX2 4-Row Bitplane Pool (`src/kernels/cpu/q2_avx2.cpp`, `iq_avx2.cpp`)**: Added 4-row `ymm` register-blocked `rows_bp4_nt1` with 12-row software prefetch and `IQ1_M` multi-token AVX2 kernels (`6.23x` vs `ggml` / `2.70x` vs default `q2_avx2` single-core cold; **`1.73x` faster 17-core CPU `down` phase at `27.4 GB/s`**).
+3. **Step 3 — CPU–GPU–PCIe Co-Scheduling & Vega 20 Exact `arch_defaults` (`+24.6%` to `+29.1%` Decode)**
+   - Microsecond timeline profiling showed the 18-core CPU pool idling `26 ms/round` at default `pcie_frac=0.37`. Rebalancing to **`pcie_frac=0.14`** (86% missed experts on 17 AVX2 cores, 14% over PCIe DMA) + **`spec_min_p=0.65`** + **`aux_cpus=1`** (async hot-expert swap on Core 35 reaching `93%–98%` VRAM hit rate) + baking **17 verified exact `gfx906` switches** into `src/core/arch_defaults.cpp` (while pruning two Vega 20 regressions `FUSE_CONVAB` and `GR_SPLIT` that cost `1.26 ms/window`) lifted exact chat decode to **`46.2 tok/s`** and practical code decode to **`55–57 tok/s`**.
+4. **Step 4 — Shipped 112-Shape `gfx906` `rocBLAS` FP16 Table (`+28.1%` 4K Prefill)**
+   - Unlocked `tune_rocblas` on `gfx906` and generated `tools/hip/gfx906-rocblas-5.5.0.cd957402309.txt` (100 of 112 GEMM shapes >5% faster; GDN `[10240, 2560]` **`2.05x–2.45x`**). Paired with `STRATA_HIP_PROMPT_F16=1` + `STRATA_HC_UPMIX=1`, hyper-connection `hc down+silu` time dropped from **`26.3%` to `3.4%`**, lifting 4K prefill from `307.1` to **`393.3 tok/s`**.
+5. **Step 5 — Hand-Written Wave64 `v_dot4_i32_i8` Online FlashAttention (`523.3 tok/s` @ 32K, `444.9 tok/s` @ 256K)**
+   - Implemented `prompt_attn_gfx906_kernel` in `src/kernels/cuda/qsa_prompt_attn.cu` for matrix-core-less Vega 20: `4 × Wave64`, 1-cycle DPP quad-packing/reductions, 24-bit 3-slice `sdot4` dot products (`1.7e-6` max error vs FP64), fused Sigmoid Gate epilogue, and a disjoint-lifetime anonymous `union` in `Smem906` keeping both `int8` (`26.4 KB`) and `k8v4` (`30.1 KB`) **under `32 KB` LDS for 2 blocks / 8 waves per CU** (`2.07x–2.53x` faster kernel). Even at `--max-context 262144 --kv k8v4`, the single 16GB MI50 statically allocates the full 256K KV cache while retaining **`5,489` VRAM expert slots (`7.36 GiB`)** and `667 MiB` free VRAM headroom.
+
+---
+
+### 4. Reproducing on `gfx906` + `Broadwell` (Linux + `rocm-gfx906:7.14`)
+
+```bash
+# 1. Build native gfx906 + Broadwell AVX2 engine
+cmake -B build-opt -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_HIP=ON \
+  -DSTRATA_HIP_GFX906=ON \
+  -DCMAKE_HIP_ARCHITECTURES=gfx906 \
+  -DCMAKE_CXX_FLAGS="-O3 -march=broadwell -mtune=broadwell"
+cmake --build build-opt -j"$(nproc)"
+
+# 2. Launch 256K Agent Server (or set --max-context 32768 --kv int8 for daily Throughput-Max)
+export LD_LIBRARY_PATH="/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
+export STRATA_Q2_BITPLANE=1 STRATA_CPU_IQ_ALL_EXACT1=1
+export STRATA_ADAPT_OVERLAP=1 STRATA_ADAPT_JOB_CPU=35 STRATA_SPEC_COST=1
+export STRATA_HIP_PROMPT_F16=1 STRATA_HC_UPMIX=1 STRATA_GFX906_PA=1
+export STRATA_ROCBLAS_TUNING="$PWD/tools/hip/gfx906-rocblas-5.5.0.cd957402309.txt"
+
+python3 serve/server.py --engine strata --host 127.0.0.1 --port 8090 -- \
+  ./build-opt/strata --serve \
+  --pack /path/to/packs/iq2_xs \
+  --native /path/to/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+  --ple-gguf /path/to/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf \
+  --expert-profile data/expert-profile.bin --expert-cache auto --prefill auto \
+  --spec 4 --spec-min-p 0.65 --mtp /path/to/mtp/rt \
+  --max-context 262144 --kv k8v4 --pcie-frac 0.14 \
+  --pool-workers 17 --host-core last --aux-cpus auto --vram-reserve-mib 768 \
+  --adapt-every 1 --adapt-swaps 160 --adapt-decay 0.97
+```
+
+<hr>
+
+<p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
     <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">

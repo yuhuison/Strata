@@ -1,4 +1,105 @@
 <p align="center">
+  <a href="README.md"><b>English (README.md)</b></a> · <b>简体中文 (README.zh-CN.md)</b>
+</p>
+
+> [!IMPORTANT]
+> **实验性老硬件极限压榨分支声明（`gfx906` Vega 20 + `Broadwell` AVX2）**
+>
+> 本仓库是基于 **[Niko1221/Strata](https://github.com/Niko1221/Strata)** 的**实验性底层算子与异构协同极限优化分支**，目标是在一台总造价仅 **约 1,500 元人民币（≈\$207 USD）的二手老工作站**（`Intel Xeon E5-2686 v4` + `64 GB` 四通道 `DDR3-1866 ECC` + 双风扇改装 `AMD Instinct MI50 16GB HBM2`）上，彻底榨干硬件物理上限，流畅运行 **125B 级稀疏 MoE 大模型 `Qwen3.8-Flash-Next` (`GSQ-RCO-IQ2_XS`)** 并打穿 **256K（`262,144`）多轮 Agent 极限上下文**。
+>
+> 如需获取官方桌面安装包、跨平台发行版及多品牌显卡通用支持，请直接访问上游主仓库：**[github.com/Niko1221/Strata](https://github.com/Niko1221/Strata)**。
+
+---
+
+## 实验平台详细参数与极限实测战报（≈1,500 CNY 主机）
+
+### 1. 测试平台完整硬件、固件与系统底座参数
+
+| 组件维度 | 详细规格与底层调优状态 |
+| :--- | :--- |
+| **整机装机成本** | **约 1,500 元人民币（≈\$207 USD）**（X99 洋垃圾平台 + 二手计算卡改装方案） |
+| **处理器 (CPU)** | **Intel Xeon E5-2686 v4**（14nm Broadwell-EP，**18 物理核 / 36 线程**，`performance` 调速器锁全核满睿频 **`3.00 GHz`**，支持 `AVX2` + `FMA3`，**`45 MiB` 20-way L3 缓存**并开启 `/sys/fs/resctrl` 硬件 CAT 支持，单路 NUMA Node 0） |
+| **系统内存 (RAM)** | **64 GB (`4 × 16 GB`) 四通道 DDR3-1866 ECC REG**（理论峰值带宽 `59.7 GB/s`；启用 `Transparent Huge Pages [always]` + `cudaHostRegister(PORTABLE)` 将 **`33.02 GiB`** 稀疏专家池零拷贝锁页映射供 GPU/CPU 并发访问） |
+| **加速卡 (GPU)** | **AMD Instinct MI50 16GB HBM2**（刷入 **AMD Radeon Pro VII** vBIOS，`Vega 20` / `gfx906:sramecc+:xnack-`，7nm，**60 CU / 3,840 流处理器**，Wave64，每 CU `64 KiB` LDS，**无任何 Matrix / Tensor Core**，具备硬件 `v_dot4_i32_i8`、`26.8 TFLOPS` 原生 FP16 与 1-cycle VALU DPP；`16 GiB` 4096-bit HBM2 硬件锁死最高档 **`1000 MHz` = `1,024 GB/s`**，由主板 AST BMC 输出显示，实测可用显存 **`15.957 GiB`**） |
+| **双风扇散热改装** | 被动散热器加装双风扇导风罩 + 自研 `hwmon` 守护服务（`strata-mi50-guard`）：连续 25+ 分钟 256K 100% 满载预填充下仅 **`32–46 °C` 边缘 / `42–60 °C` HBM2 / `47–84 °C` 结温**（平均功耗 `118.4 W`，全程 **0 次热降频**） |
+| **PCIe 互连通道** | **PCIe 3.0 x16**（内核开启 `iommu=pt` 直通，`setpci` 将 BIOS 默认 `256B` 解锁至 **`MaxReadReq = 4096 Bytes`**，强制关闭根端口与显卡 ASPM L1）→ **实测持续 H2D 锁页 DMA 带宽达 `13.3 GB/s`** |
+| **NVMe 存储流** | PCIe NVMe SSD 通过无缓冲 `O_DIRECT` 随机读取 `26.8 GiB`（3.2 亿行）逐层词表嵌入（PLE）n-gram 分片，实测 **`38,069 rows/s`** |
+| **系统与编译栈** | Ubuntu 24.04 LTS（Linux 6.8，`ulimit -l unlimited`，`vm.swappiness=1`），宿主机原生提取 **`rocm-gfx906:7.14`**（`AMD clang 23.0.0git +PATCHED`、`rocBLAS 5.5.0.cd957402309`、`-O3 -march=broadwell -mtune=broadwell`、`CMAKE_HIP_ARCHITECTURES=gfx906`） |
+| **评测大模型** | **ISTA-DASLab `Qwen3.8-Flash-Next` (`GSQ-RCO-IQ2_XS`)**（≈125B 总参数稀疏 MoE，每层 512 专家选 Top-10，36 层 GDN 线性递归 + 12 层 QSA 稀疏块注意力，`36.5 GiB` 主分片 + `26.8 GiB` PLE 分片 + `952 MiB` MTP 投机层，原生 `262,144` 训练上下文） |
+
+---
+
+### 2. 端到端实测成绩单（冻结原版基线 vs 极限优化版）
+
+严格按照规范将 Prompt 预填充（Prefill）、纯 MTP 投机解码（Decode）、Prefix Cache 增量首字响应（TTFT）与 Suffix 辅助代码编辑分开统计：
+
+| 评测场景（`Qwen3.8-Flash-Next` `IQ2_XS` + MTP `--spec 4`） | 原版开箱基线 (`S0_Baseline`) | 本仓库优化版 (`Throughput_Max`) | 实测提升幅度 | 精度校验与说明 |
+| :--- | :---: | :---: | :---: | :--- |
+| **日常对话 / 代码生成 Decode（中位数）** | `36.60 tok/s` | **`45.60 tok/s`** | **`+24.6%`** | 3 轮完全反序共 9 次生成中位数 |
+| **代码生成 Decode（单请求峰值）** | `48.80 tok/s` | **`57.00 tok/s`**（常态 `55+`） | **`+16.8%`** | 结构化代码高 MTP 4-token 接受率 |
+| **零跳专家严格精确档 (`Exact_Max`, `TAIL_SKIP=0`)** | `35.80 tok/s` (`E0`) | **`46.20 tok/s`**（确认均值 `45.27`） | **`+29.1%`** | CLI 128-token 贪婪解码 **100% 逐位一致** |
+| **4K 上下文 Prompt Prefill（冷 / 热）** | `308.30 tok/s` | **`426.50` / `455.20 tok/s`** | **`+38.3%` / `+48.2%`** | 开启 `STRATA_PA_FAST=1` 可达 **`463.60 tok/s` (`+50.4%`)** |
+| **4K 上下文长文 Decode（冷 / 热）** | `35.50 tok/s` | **`40.10` / `43.30 tok/s`** | **`+13.0%` / `+22.0%`** | `Exact_Max` 4K Decode 亦达 **`40.40 tok/s`** (`+28.3%` vs `E0`) |
+| **32K 长上下文（`27,773` tok，`int8` KV）** | Prefill `345.7` / Decode `43.9` | **Prefill `523.3` / Decode `47.3 tok/s`** | **Prefill `+51.4%`** | 单次省 `27.3 秒`；隐藏口令 100% 精准召回 |
+| **64K 超长上下文（`64,412` tok，`k8v4` KV）** | — | **Prefill `519.0` / Decode `43.8 tok/s`** | `124.1 s` 读完 6.4 万词 | 隐藏口令 100% 召回；常驻 `6,707` 显存专家槽 |
+| **128K 满载代码库冷摄入（`127,949` tok，`k8v4`）** | — | **Prefill `484.3` / Decode `38.9 tok/s`** | `264.2 s` 读完 12.8 万词 | `19.1K` 与 `108.2K` 双深度密钥 **2/2 精准命中** |
+| **256K 极限 Agent 冷摄入（`251,964–255,693` tok）** | — | **Prefill `444.9` / `<think>`+Tool `41.5 tok/s`** | **单卡 16GB 达 256K 的 97.5%** | **`12.4K / 125.4K / 238.7K` 三密钥命中 + 跨 24 万词工具调用** |
+| **256K 多轮 Agent 缓存续写（`255,042` tok）** | — | **TTFT `9.63 s` / 编辑生成 `54.8 tok/s`** | **首字响应提速 `58.8x`** | 复用 `252,163` 缓存词 + 增量读取 `2,619` 报错词 |
+| **248,320 全词表 FP64 前向 KL 散度** | `0.009351` | **`0.009299`（Top-1 `5/5` 一致）** | **KL 散度低于原版默认档** | `Exact_Max` 平均 KL 低至 **`0.000563`** |
+
+---
+
+### 3. 逐层优化拆解（每一步是怎么榨出性能的）
+
+1. **Step 0 — 宿主机 DMA、THP 零拷贝锁页与双风扇 HBM2 锁频**
+   - 解锁 PCIe `MaxReadReq=4096B` + `iommu=pt` 跑出 `13.3 GB/s` 持续 H2D DMA，`THP [always]` 锁页 `33.02 GiB` 专家池，将显存空闲底噪压至 `27 MiB`，并硬件锁定 MI50 HBM2 `1000 MHz`（`1,024 GB/s`）。
+2. **Step 1 & 2 — Vega 20 (`gfx906`) GCN 算子与 Broadwell AVX2 位平面算子重构（零参数纯代码收益，100% 逐位一致）**
+   - **GPU MoE 分组专家核 (`src/kernels/cuda/iq_kernels.cu`)**：打通 `IQ2_S / IQ2_XXS / IQ1_M` Mode-8 单次 Launch 融合核（`Gate+Up+SwiGLU+Q8_1`），首创 **11-dword 无 Bank 冲突预转置位平面核**（`gcd(11,32)=1`）消除 `Q2_0` Down 内层 `__byte_perm`，用 **`nib_neg4` 零分支补码取反**将 `dp4a` 指令数腰斩（`16 → 8`），外提多 Token `DecG` 查表，并动态收敛 `LNT=1/2/4` LDS 占用（`20.7 KB → 11.3 KB`）使驻留从 **3 跃升至 5 Blocks/CU**（60 CU 单波 300 Blocks 吞吐完结）。48 层真权重 MoE 提速 **`1.48x` (`T=1`)** 与 **`1.56x` (`T=3` MTP，`IQ2_XXS` 达 `2.65x`)**，不加任何调优开关即令 `--serve` 精确 4K Decode 暴涨 **`+27.3%`**（`31.5 → 40.1 tok/s`）。
+   - **路由链、BF16/量化 GEMV 与 248K 大词表验证核 (`native_bf16.cu`, `native_router.cu`, `native_mmvq.cu`, `s26_tsum.cuh`, `verify_kernels.cu`)**：用 128-CTA 4 行分块核根治 `[512][2560]` Router 在 60 CU 上的 512-CTA 尾波抖动（单核快 **`4.35x–5.67x`**，48 层完整路由链快 **`3.05x`**），用 1-cycle 硬件 VALU DPP 指令砍掉 **67%–80%** 的 `ds_bpermute_b32` LDS 通信，并将 Wave64 248K 大词表 `argmax_rows` 提速 **`7.84x`**。
+   - **Broadwell 18 核 AVX2 位平面池 (`src/kernels/cpu/q2_avx2.cpp`, `iq_avx2.cpp`)**：新增 4 行 `ymm` 寄存器分块核 `rows_bp4_nt1` + 提前 12 行软件预取并解锁 `IQ1_M` 多 Token AVX2 路径（单核冷内存 `Q2_0` Down 较 `ggml` 快 **`6.23x`**、较默认 `q2_avx2` 快 **`2.70x`**；17 核端到端 CPU `down` 阶段提速 **`1.73x`**，带宽达 **`27.4 GB/s`**）。
+3. **Step 3 — CPU–GPU–PCIe 异构排期重平衡 + `arch_defaults` 精确开关固化（Decode 再涨至 `+29.1%`）**
+   - 微秒级画像发现默认 `pcie_frac=0.37` 下 18 核 CPU 每轮白等 GPU `26 ms`。重平衡至 **`pcie_frac=0.14`**（86% 未命中专家走 17 核 AVX2 位平面池、14% 走 PCIe DMA）+ **`spec_min_p=0.65`** + **`aux_cpus=1`**（Core 35 异步热专家换入，活跃对话显存命中率达 **`93%–98%`**），并在 `src/core/arch_defaults.cpp` 自动固化 **17 项实测正向的 `gfx906` 精确开关**（剔除反向拖慢 `1.26 ms/window` 的 `FUSE_CONVAB` 与 `GR_SPLIT`）。
+4. **Step 4 — 随库附带 112 形状 `gfx906` `rocBLAS` FP16 调优表（4K Prefill `+28.1%`）**
+   - 为 `gfx906` 解锁 `tune_rocblas` 并实测生成 `tools/hip/gfx906-rocblas-5.5.0.cd957402309.txt`（112 组形状中 100 组提速 >5%，GDN 主投影提速 **`2.05x–2.45x`**），配合 `STRATA_HIP_PROMPT_F16=1` + `STRATA_HC_UPMIX=1` 将 `hc down+silu` 耗时占比从 **`26.3%` 压至 `3.4%`**，4K Prefill 从 `307.1` 跃升至 **`393.3 tok/s`**。
+5. **Step 5 — 手写 Wave64 `v_dot4_i32_i8` 在线 FlashAttention（32K Prefill 冲上 `523.3 tok/s`，256K 稳跑 `444.9 tok/s`）**
+   - 在 `src/kernels/cuda/qsa_prompt_attn.cu` 为无矩阵核的 Vega 20 手写 `prompt_attn_gfx906_kernel`：`4 × Wave64` 协作、1-cycle DPP 打包归约、24-bit 三路拆分 `sdot4` 精确内积（相对 FP64 误差仅 `1.7e-6`）、融合 Sigmoid Gate 尾声，并通过 `Smem906` 生命周期互斥匿名 `union` 将 `int8`（`26.4 KB`）与 `k8v4`（`30.1 KB`）全部压进 **`< 32 KB` LDS 红线达成每 CU 双 Block / 8 Wave64 驻留**（单算子快 **`2.07x–2.53x`**）。在 `--max-context 262144 --kv k8v4` 下，单张 16GB MI50 静态预分配满 256K KV 后仍常驻 **`5,489` 个显存专家槽（`7.36 GiB`）** 并保有 `667 MiB` 安全空闲显存。
+
+---
+
+### 4. 在 `gfx906` + `Broadwell` 上一键复现构建与启动
+
+```bash
+# 1. 编译原生 gfx906 + Broadwell AVX2 极限引擎
+cmake -B build-opt -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_HIP=ON \
+  -DSTRATA_HIP_GFX906=ON \
+  -DCMAKE_HIP_ARCHITECTURES=gfx906 \
+  -DCMAKE_CXX_FLAGS="-O3 -march=broadwell -mtune=broadwell"
+cmake --build build-opt -j"$(nproc)"
+
+# 2. 启动 256K Agent 生产服务（日常 32K 满血档可改为 --max-context 32768 --kv int8）
+export LD_LIBRARY_PATH="/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
+export STRATA_Q2_BITPLANE=1 STRATA_CPU_IQ_ALL_EXACT1=1
+export STRATA_ADAPT_OVERLAP=1 STRATA_ADAPT_JOB_CPU=35 STRATA_SPEC_COST=1
+export STRATA_HIP_PROMPT_F16=1 STRATA_HC_UPMIX=1 STRATA_GFX906_PA=1
+export STRATA_ROCBLAS_TUNING="$PWD/tools/hip/gfx906-rocblas-5.5.0.cd957402309.txt"
+
+python3 serve/server.py --engine strata --host 127.0.0.1 --port 8090 -- \
+  ./build-opt/strata --serve \
+  --pack /path/to/packs/iq2_xs \
+  --native /path/to/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+  --ple-gguf /path/to/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf \
+  --expert-profile data/expert-profile.bin --expert-cache auto --prefill auto \
+  --spec 4 --spec-min-p 0.65 --mtp /path/to/mtp/rt \
+  --max-context 262144 --kv k8v4 --pcie-frac 0.14 \
+  --pool-workers 17 --host-core last --aux-cpus auto --vram-reserve-mib 768 \
+  --adapt-every 1 --adapt-swaps 160 --adapt-decay 0.97
+```
+
+<hr>
+
+<p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
     <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
