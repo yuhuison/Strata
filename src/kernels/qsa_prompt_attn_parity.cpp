@@ -350,8 +350,9 @@ int main(int argc, char** argv) {
         int dev = 0;
         hipDeviceProp_t prop{};
         if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&prop, dev) != hipSuccess) return 2;
-        if (std::strncmp(prop.gcnArchName, "gfx12", 5) != 0 && std::strncmp(prop.gcnArchName, "gfx11", 5) != 0) {
-            std::printf("SKIP: %s is not gfx11 / gfx12 (the matrix-core prompt attention)\n", prop.gcnArchName);
+        if (std::strncmp(prop.gcnArchName, "gfx12", 5) != 0 && std::strncmp(prop.gcnArchName, "gfx11", 5) != 0 &&
+            std::strncmp(prop.gcnArchName, "gfx906", 6) != 0) {
+            std::printf("SKIP: %s is not gfx906 / gfx11 / gfx12\n", prop.gcnArchName);
             return 77;
         }
 #if defined(_WIN32)

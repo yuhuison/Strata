@@ -35,4 +35,7 @@ inline bool gfx_arch_is_gfx1151(const char* gcn) { return gfx_arch_is(gcn, "gfx1
 /// RDNA4 (Radeon AI PRO R9700 = gfx1201, RX 9070 / 9070 XT = gfx1201, RX 9060 = gfx1200).
 inline bool gfx_arch_is_gfx12(const char* gcn) { return gfx_arch_is(gcn, "gfx1200") || gfx_arch_is(gcn, "gfx1201"); }
 
+/// Vega 20 (Radeon Instinct MI50 / MI60, Radeon VII / Pro VII = gfx906).
+inline bool gfx_arch_is_gfx906(const char* gcn) { return gfx_arch_is(gcn, "gfx906"); }
+
 }  // namespace strata::kernels

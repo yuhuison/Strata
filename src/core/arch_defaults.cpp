@@ -60,6 +60,37 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
         t.push_back({"STRATA_GR_Q8_PFS", "1"});
         return t;
     }
+    if (strata::kernels::gfx_arch_is_gfx906(gcn_arch)) {
+        // gfx906 (Vega 20, Instinct MI50 / MI60 / Radeon VII): bitwise-exact switches measured per-stage with
+        // STRATA_VERIFY_PROFILE=1 and interleaved A-B-B-A on Instinct MI50 (gfx906:sramecc+:xnack-, Qwen3.8-Flash-Next
+        // IQ2_XS). FUSE_CONVAB (+0.51 ms/window slower), GR_SPLIT (+0.75 ms/window slower) and GDN_SPLIT (conflicts
+        // with --lookup-max-t > 8) stay off. STRATA_GFX906_DEFAULTS=0 turns the table off.
+        if (defaults026) return t;
+        const char* off906 = std::getenv("STRATA_GFX906_DEFAULTS");
+        if (off906 != nullptr && off906[0] == '0') return t;
+        t = {
+            // prompt (exact)
+            {"STRATA_GDN_HEAD", "1"},
+            {"STRATA_GDN_PP", "2"},
+            {"STRATA_GDN_CONVL2", "1"},
+            {"STRATA_GDN_NOY", "1"},
+            {"STRATA_CVEC_FUSE", "1"},
+            // decode (exact)
+            {"STRATA_ATTN_LANECELL", "1"},
+            {"STRATA_ATTN_MERGE_V2", "1"},
+            {"STRATA_GFX906_ATTN_QUERY_SWIZZLE", "1"},
+            {"STRATA_GFX906_ATTN_REDUCE12", "1"},
+            {"STRATA_QSA_ROWS", "1"},
+            {"STRATA_Q8_PACKED", "1"},
+            {"STRATA_Q6_PACKED", "1"},
+            {"STRATA_GU_SWIGLU", "1"},
+            {"STRATA_TSUM", "1"},
+            {"STRATA_LFUSE", "1"},
+            {"STRATA_QFUSE", "1"},
+            {"STRATA_PLE_BATCH", "1"},
+        };
+        return t;
+    }
     if (!strata::kernels::gfx_arch_is_gfx1151(gcn_arch)) return t;
     const char* off = std::getenv("STRATA_GFX1151_DEFAULTS");
     if (off != nullptr && off[0] == '0') return t;
@@ -322,10 +353,12 @@ std::vector<std::string> apply_arch_defaults(const char* gcn_arch, bool integrat
     }
     if (!set.empty()) {
         const bool g12 = strata::kernels::gfx_arch_is_gfx12(gcn_arch);
+        const bool g906 = strata::kernels::gfx_arch_is_gfx906(gcn_arch);
+        const char* arch_label = g12 ? "gfx12 (RDNA4)" : g906 ? "gfx906 (Vega 20)" : "gfx1151 (Strix Halo)";
+        const char* off_var = g12 ? "STRATA_GFX12_DEFAULTS" : g906 ? "STRATA_GFX906_DEFAULTS" : "STRATA_GFX1151_DEFAULTS";
         std::fprintf(stderr, "strata: %s: %zu exact speed switches on by default (%s=0 turns "
                              "them off; a switch you set is kept): ",
-                     g12 ? "gfx12 (RDNA4)" : "gfx1151 (Strix Halo)", set.size(),
-                     g12 ? "STRATA_GFX12_DEFAULTS" : "STRATA_GFX1151_DEFAULTS");
+                     arch_label, set.size(), off_var);
         for (size_t i = 0; i < set.size(); ++i) std::fprintf(stderr, "%s%s", i ? " " : "", set[i].c_str() + 7);
         std::fprintf(stderr, "\n");
     }

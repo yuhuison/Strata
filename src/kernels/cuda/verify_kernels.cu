@@ -1253,13 +1253,14 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     // default kernels loop over the tokens, the STRATA_GDN_SPLIT ones hold kVerifyMaxT per thread
     static const bool split = [] { const char* v = std::getenv("STRATA_GDN_SPLIT"); return v && v[0] == '1'; }();
     if (!state || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k || n_tok < 1 ||
-        n_tok > (split ? kVerifyMaxT : kVerifyLongT)) {
+        n_tok > kVerifyLongT) {
         std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
         std::exit(1);
     }
     // S26: the split runs where it is faster (gfx1151 harness, h_v 48: the commit 8-19% per call; a window of 2+ rows
-    // 3-13%; one row: no gain, the old kernel stays) - bitwise equal in every case
-    if (split && (t_out_begin >= n_tok || n_tok - t_out_begin >= 2)) {
+    // 3-13%; one row: no gain, the old kernel stays) - bitwise equal in every case. Windows wider than kVerifyMaxT
+    // (such as --lookup-max-t 12 suffix drafts) fall through to the looping gdn_step_norm_multi_kernel below.
+    if (split && n_tok <= kVerifyMaxT && (t_out_begin >= n_tok || n_tok - t_out_begin >= 2)) {
         const dim3 grid((unsigned) h_v, S / GS_COLS), block(GS_COLS, RG);
         if (t_out_begin >= n_tok) {   // no outputs (the commit): the state only
             if (n_tok > kVerifyNarrowT)

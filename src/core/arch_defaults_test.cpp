@@ -211,6 +211,21 @@ int main() {
     put("STRATA_GFX12_DEFAULTS", "0");
     CHECK(arch_default_env("gfx1201").empty());
     unset("STRATA_GFX12_DEFAULTS");
+    // gfx906 (Vega 20): exact table on by default, off under STRATA_GFX906_DEFAULTS=0 or defaults026
+    unset("STRATA_GFX906_DEFAULTS");
+    for (const char* a : {"gfx906", "gfx906:sramecc+:xnack-"}) {
+        const auto t906 = arch_default_env(a, false);
+        CHECK(t906.size() == 17);
+        for (const auto& kv : t906) {
+            CHECK(kv.first != "STRATA_FUSE_CONVAB" && kv.first != "STRATA_GR_SPLIT" && kv.first != "STRATA_GDN_SPLIT" &&
+                  kv.first != "STRATA_HIP_PROMPT_F16" && kv.first != "STRATA_HIP_WMMA");
+        }
+    }
+    CHECK(arch_default_env("gfx906", true).empty());
+    CHECK(arch_default_env("gfx9060", false).empty());
+    put("STRATA_GFX906_DEFAULTS", "0");
+    CHECK(arch_default_env("gfx906", false).empty());
+    unset("STRATA_GFX906_DEFAULTS");
     // a user's setting wins, whatever it is; the rest are set
     put("STRATA_TSUM", "0");
     unset("STRATA_QFUSE");

@@ -2371,6 +2371,465 @@ bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, 
     }
     return true;
 }
+
+#if defined(STRATA_HIP_GFX906)
+// ---- gfx906 (Vega 20, Wave64): online FlashAttention prompt kernel on v_dot4_i32_i8 (sdot4).
+// 4 Wave64 waves (THREADS_906 = 256), one wave per 64-dim KV scale group [64*wave .. 64*wave + 64).
+// Q and P*v_scale are split into signed int8 parts (SPLIT3=true: 3 signed parts, 24-bit exact reconstruction;
+// SPLIT3=false via STRATA_PA_FAST=1: 2 signed parts, 16-bit), K and V enter directly as signed int8 codes.
+// Supports KV_MODE=1 (--kv int8, plus fused output gate via GATE=true) and KV_MODE=3 (--kv k8v4, int8 K + q4_0 V).
+// Opt-in via STRATA_GFX906_PA=1 (or STRATA_HIP_WMMA=1 in qsa_prompt_attn_parity); default off keeps bitwise parity.
+constexpr int THREADS_906 = 256;
+
+__device__ __forceinline__ uint32_t pack4_s8_906(int a, int b, int c, int d) {
+    return (uint32_t) (a & 0xff) | ((uint32_t) (b & 0xff) << 8) | ((uint32_t) (c & 0xff) << 16) | ((uint32_t) (d & 0xff) << 24);
+}
+__device__ __forceinline__ uint32_t pack4_quad_906(int b) {   // lane 0 of each 4-lane quad packs {lane0, lane1, lane2, lane3} via 1-cycle DPP
+    const int b1 = __builtin_amdgcn_mov_dpp(b, 0x55, 0xf, 0xf, true);
+    const int b2 = __builtin_amdgcn_mov_dpp(b, 0xaa, 0xf, 0xf, true);
+    const int b3 = __builtin_amdgcn_mov_dpp(b, 0xff, 0xf, 0xf, true);
+    return pack4_s8_906(b, b1, b2, b3);
+}
+__device__ __forceinline__ int dpp_xor1_i32(int v) {
+    return __builtin_amdgcn_mov_dpp(v, 0xb1, 0xf, 0xf, true);
+}
+__device__ __forceinline__ float dpp_xor1_f32(float v) {
+    return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0xb1, 0xf, 0xf, true));
+}
+__device__ __forceinline__ float dpp_xor2_f32(float v) {
+    return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x4e, 0xf, 0xf, true));
+}
+__device__ __forceinline__ void split3_s8_906(float x, int& h, int& m, int& l) {   // |x| <= 126: X = h*32768 + m*256 + l
+    const int X = __float2int_rn(x * 32768.0f);
+    h = (X + 16384) >> 15;          // [-126 .. +126]
+    const int r1 = X - (h << 15);   // [-16384 .. +16383]
+    m = (r1 + 128) >> 8;            // [-64 .. +64]
+    l = r1 - (m << 8);              // [-128 .. +127]
+}
+__device__ __forceinline__ float join3_s8_906(int ih, int im, int il) {
+    return (float) ih + (float) ((im << 8) + il) * (1.0f / 32768.0f);
+}
+__device__ __forceinline__ void split2_s8_906(float x, int& h, int& m) {   // |x| <= 126: X = h*256 + m
+    const int X = __float2int_rn(x * 256.0f);
+    h = (X + 128) >> 8;     // [-126 .. +126]
+    m = X - (h << 8);       // [-128 .. +127]
+}
+__device__ __forceinline__ float join2_s8_906(int ih, int im) {
+    return (float) ih + (float) im * (1.0f / 256.0f);
+}
+
+template <int KV_MODE>
+struct alignas(16) Smem906 {
+    static constexpr int VS_SUB = KV_MODE == 3 ? 2 : 1;
+    alignas(16) uint32_t q[4][3][G][2][8];             // [wave][part][head][khalf][8 dwords]: 9,216 B
+    alignas(16) uint32_t vraw[4][WCH][16];             // [wave][cell][16 dwords]: 8,192 B
+    // Q.K partial sums (`part`, dead after softmax __syncthreads) and quantized P (`ph/pm/pl/pinv`, written after
+    // softmax __syncthreads) have disjoint lifetimes; sharing them keeps Smem906<3> (k8v4) at 30.1 KB < 32 KB so
+    // both int8 and k8v4 run at 2 blocks (8 Wave64 waves) per CU on gfx906.
+    union {
+        float part[4][G][WCH + 1];                     // 6,336 B
+        struct {
+            alignas(16) uint32_t ph[4][VS_SUB][G][WCH / 4];
+            alignas(16) uint32_t pm[4][VS_SUB][G][WCH / 4];
+            alignas(16) uint32_t pl[4][VS_SUB][G][WCH / 4];
+            float pinv[4][VS_SUB][G];
+        };
+    };
+    float p[G][WCH + 1];                               // 1,584 B
+    float qinv[4][G];                                  // 192 B
+    float vs[4][VS_SUB][WCH];                          // 512 B (int8) / 1,024 B (k8v4)
+    int valid[WCH];
+    float alpha[16];
+    float lsum[16];
+    float mrow[16];
+};
+
+template <int KV_MODE, bool SPLIT3, bool GATE>
+__global__ void __launch_bounds__(THREADS_906, 2) prompt_attn_gfx906_kernel(
+    const float* __restrict__ q, QsaAttnPools p, const int32_t* __restrict__ ids, const int32_t* __restrict__ steps,
+    int n_kv_heads, int page_size, float scale_log2, float* __restrict__ attn, int cap,
+    const float* __restrict__ qf = nullptr, uint16_t* __restrict__ o16 = nullptr, int64_t ld16 = 0) {
+    __shared__ Smem906<KV_MODE> S;
+    constexpr int VS_SUB = KV_MODE == 3 ? 2 : 1;
+    const int qi = blockIdx.x, kvh = blockIdx.y;
+    const int n_head = n_kv_heads * G;
+    q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    if constexpr (!GATE) attn += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    ids += (size_t) qi * cap;
+    const int n = __ldg(steps + (size_t) qi * kStepCount + kStepWidth);
+
+    const int t = threadIdx.x, lane = t & 63, wave = t >> 6;
+    const int dim0 = wave * 64;
+    if (t < 16) {
+        S.mrow[t] = -INFINITY;
+        S.lsum[t] = 0.0f;
+        S.alpha[t] = 0.0f;
+    }
+
+    // Phase 0: quantize Q[0..11, dim0..dim0+63] into S.q[wave] once per block.
+    {
+        const int dw = lane >> 2, sub4 = lane & 3;
+        const int kh = dw >> 3, j8 = dw & 7;
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            const float qv = q[(size_t) h * HD + dim0 + lane];
+            float mx = fabsf(qv);
+            mx = fmaxf(mx, dpp_xor1_f32(mx));
+            mx = fmaxf(mx, dpp_xor2_f32(mx));
+#pragma unroll
+            for (int o = 4; o <= 32; o <<= 1) mx = fmaxf(mx, __shfl_xor(mx, o, 64));
+            const float up = mx > 0.0f ? 126.0f / mx : 0.0f;
+            if (lane == 0) S.qinv[wave][h] = mx * (1.0f / 126.0f);
+            int bh = 0, bm = 0, bl = 0;
+            if constexpr (SPLIT3) split3_s8_906(qv * up, bh, bm, bl);
+            else split2_s8_906(qv * up, bh, bm);
+            const uint32_t wh = pack4_quad_906(bh);
+            const uint32_t wm = pack4_quad_906(bm);
+            uint32_t wl = 0;
+            if constexpr (SPLIT3) wl = pack4_quad_906(bl);
+            if (sub4 == 0) {
+                S.q[wave][0][h][kh][j8] = wh;
+                S.q[wave][1][h][kh][j8] = wm;
+                if constexpr (SPLIT3) S.q[wave][2][h][kh][j8] = wl;
+            }
+        }
+    }
+    __syncthreads();
+
+    float acc[G];
+#pragma unroll
+    for (int h = 0; h < G; ++h) acc[h] = 0.0f;
+
+    const int n_chunks = (n + WCH - 1) / WCH;
+    const int c_ld = lane >> 1, khalf = lane & 1;
+    const int dw_pv = lane >> 2;
+    const uint32_t sel01 = (uint32_t) (lane & 3) | ((uint32_t) (4 + (lane & 3)) << 4);
+
+    auto resolve_row = [&](int ci_idx) -> long long {
+        const int pos_c = ci_idx * WCH + c_ld;
+        long long r = -1;
+        if (pos_c < n) {
+            const int cell = __ldg(ids + pos_c);
+            const long long page = (long long) __ldg(p.page_table + cell / page_size);
+            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+        }
+        return r;
+    };
+
+    long long next_row = n_chunks > 0 ? resolve_row(0) : -1;
+
+    for (int ci = 0; ci < n_chunks; ++ci) {
+        const long long row_c = next_row;
+        if (ci + 1 < n_chunks) next_row = resolve_row(ci + 1);
+
+        // Issue global K and V reads upfront so V stays in flight across Q.K.
+        uint4 k0 = make_uint4(0, 0, 0, 0), k1 = make_uint4(0, 0, 0, 0);
+        uint4 v0 = make_uint4(0, 0, 0, 0), v1 = make_uint4(0, 0, 0, 0);
+        float ksc = 0.0f, vsc = 0.0f;
+        if (row_c >= 0) {
+            const uint4* ksrc = reinterpret_cast<const uint4*>(p.k_q + row_c * HD + dim0 + khalf * 32);
+            k0 = __ldg(ksrc);
+            k1 = __ldg(ksrc + 1);
+            ksc = __half2float(__ushort_as_half(__ldg(p.k_scale + row_c * (HD / KV_Q8_GROUP) + wave)));
+            if constexpr (KV_MODE == 1) {
+                const uint4* vsrc = reinterpret_cast<const uint4*>(p.v_q + row_c * HD + dim0 + khalf * 32);
+                v0 = __ldg(vsrc);
+                v1 = __ldg(vsrc + 1);
+                if (khalf == 0) vsc = __half2float(__ushort_as_half(__ldg(p.v_scale + row_c * (HD / KV_Q8_GROUP) + wave)));
+            } else {
+                const uint8_t* blk = p.v_q4 + row_c * 144 + (2 * wave + khalf) * 18;
+                vsc = __half2float(__ushort_as_half(__ldg(reinterpret_cast<const uint16_t*>(blk))));
+                const uint16_t* qs16 = reinterpret_cast<const uint16_t*>(blk + 2);
+                uint32_t vx[8];
+#pragma unroll
+                for (int m = 0; m < 4; ++m) {
+                    const uint32_t raw = (uint32_t) __ldg(qs16 + 2 * m) | ((uint32_t) __ldg(qs16 + 2 * m + 1) << 16);
+                    vx[m] = (uint32_t) __vsub4(raw & 0x0f0f0f0fu, 0x08080808u);
+                    vx[m + 4] = (uint32_t) __vsub4((raw >> 4) & 0x0f0f0f0fu, 0x08080808u);
+                }
+                v0 = make_uint4(vx[0], vx[1], vx[2], vx[3]);
+                v1 = make_uint4(vx[4], vx[5], vx[6], vx[7]);
+            }
+        }
+
+        // Stage V codes via 128-bit LDS stores, scales, and valid[].
+        uint4* vdst = reinterpret_cast<uint4*>(&S.vraw[wave][c_ld][khalf * 8]);
+        vdst[0] = v0;
+        vdst[1] = v1;
+        if constexpr (KV_MODE == 1) {
+            if (khalf == 0) S.vs[wave][0][c_ld] = vsc;
+        } else {
+            S.vs[wave][khalf][c_ld] = vsc;
+        }
+        if (wave == 0 && khalf == 0) S.valid[c_ld] = (row_c >= 0) ? 1 : 0;
+
+        // Q.K over this wave's 64 dims: 128-bit LDS broadcast loads + 1-cycle DPP xor1 reduction.
+        const int kx[8] = {(int) k0.x, (int) k0.y, (int) k0.z, (int) k0.w, (int) k1.x, (int) k1.y, (int) k1.z, (int) k1.w};
+#pragma unroll
+        for (int h0 = 0; h0 < G; h0 += 2) {
+            int ih0 = 0, im0 = 0, il0 = 0;
+            int ih1 = 0, im1 = 0, il1 = 0;
+            const uint4* qh0_4 = reinterpret_cast<const uint4*>(S.q[wave][0][h0][khalf]);
+            const uint4* qm0_4 = reinterpret_cast<const uint4*>(S.q[wave][1][h0][khalf]);
+            const uint4* qh1_4 = reinterpret_cast<const uint4*>(S.q[wave][0][h0 + 1][khalf]);
+            const uint4* qm1_4 = reinterpret_cast<const uint4*>(S.q[wave][1][h0 + 1][khalf]);
+            const uint4 qh0a = qh0_4[0], qh0b = qh0_4[1];
+            const uint4 qm0a = qm0_4[0], qm0b = qm0_4[1];
+            const uint4 qh1a = qh1_4[0], qh1b = qh1_4[1];
+            const uint4 qm1a = qm1_4[0], qm1b = qm1_4[1];
+            ih0 = strata_dp4a((int) qh0a.x, kx[0], ih0); ih0 = strata_dp4a((int) qh0a.y, kx[1], ih0);
+            ih0 = strata_dp4a((int) qh0a.z, kx[2], ih0); ih0 = strata_dp4a((int) qh0a.w, kx[3], ih0);
+            ih0 = strata_dp4a((int) qh0b.x, kx[4], ih0); ih0 = strata_dp4a((int) qh0b.y, kx[5], ih0);
+            ih0 = strata_dp4a((int) qh0b.z, kx[6], ih0); ih0 = strata_dp4a((int) qh0b.w, kx[7], ih0);
+            im0 = strata_dp4a((int) qm0a.x, kx[0], im0); im0 = strata_dp4a((int) qm0a.y, kx[1], im0);
+            im0 = strata_dp4a((int) qm0a.z, kx[2], im0); im0 = strata_dp4a((int) qm0a.w, kx[3], im0);
+            im0 = strata_dp4a((int) qm0b.x, kx[4], im0); im0 = strata_dp4a((int) qm0b.y, kx[5], im0);
+            im0 = strata_dp4a((int) qm0b.z, kx[6], im0); im0 = strata_dp4a((int) qm0b.w, kx[7], im0);
+            ih1 = strata_dp4a((int) qh1a.x, kx[0], ih1); ih1 = strata_dp4a((int) qh1a.y, kx[1], ih1);
+            ih1 = strata_dp4a((int) qh1a.z, kx[2], ih1); ih1 = strata_dp4a((int) qh1a.w, kx[3], ih1);
+            ih1 = strata_dp4a((int) qh1b.x, kx[4], ih1); ih1 = strata_dp4a((int) qh1b.y, kx[5], ih1);
+            ih1 = strata_dp4a((int) qh1b.z, kx[6], ih1); ih1 = strata_dp4a((int) qh1b.w, kx[7], ih1);
+            im1 = strata_dp4a((int) qm1a.x, kx[0], im1); im1 = strata_dp4a((int) qm1a.y, kx[1], im1);
+            im1 = strata_dp4a((int) qm1a.z, kx[2], im1); im1 = strata_dp4a((int) qm1a.w, kx[3], im1);
+            im1 = strata_dp4a((int) qm1b.x, kx[4], im1); im1 = strata_dp4a((int) qm1b.y, kx[5], im1);
+            im1 = strata_dp4a((int) qm1b.z, kx[6], im1); im1 = strata_dp4a((int) qm1b.w, kx[7], im1);
+            if constexpr (SPLIT3) {
+                const uint4* ql0_4 = reinterpret_cast<const uint4*>(S.q[wave][2][h0][khalf]);
+                const uint4* ql1_4 = reinterpret_cast<const uint4*>(S.q[wave][2][h0 + 1][khalf]);
+                const uint4 ql0a = ql0_4[0], ql0b = ql0_4[1];
+                const uint4 ql1a = ql1_4[0], ql1b = ql1_4[1];
+                il0 = strata_dp4a((int) ql0a.x, kx[0], il0); il0 = strata_dp4a((int) ql0a.y, kx[1], il0);
+                il0 = strata_dp4a((int) ql0a.z, kx[2], il0); il0 = strata_dp4a((int) ql0a.w, kx[3], il0);
+                il0 = strata_dp4a((int) ql0b.x, kx[4], il0); il0 = strata_dp4a((int) ql0b.y, kx[5], il0);
+                il0 = strata_dp4a((int) ql0b.z, kx[6], il0); il0 = strata_dp4a((int) ql0b.w, kx[7], il0);
+                il1 = strata_dp4a((int) ql1a.x, kx[0], il1); il1 = strata_dp4a((int) ql1a.y, kx[1], il1);
+                il1 = strata_dp4a((int) ql1a.z, kx[2], il1); il1 = strata_dp4a((int) ql1a.w, kx[3], il1);
+                il1 = strata_dp4a((int) ql1b.x, kx[4], il1); il1 = strata_dp4a((int) ql1b.y, kx[5], il1);
+                il1 = strata_dp4a((int) ql1b.z, kx[6], il1); il1 = strata_dp4a((int) ql1b.w, kx[7], il1);
+            }
+            const int o_ih0 = dpp_xor1_i32(ih0), o_im0 = dpp_xor1_i32(im0);
+            const int o_ih1 = dpp_xor1_i32(ih1), o_im1 = dpp_xor1_i32(im1);
+            const int my_h = h0 + khalf;
+            const int s_ih = khalf ? (ih1 + o_ih1) : (ih0 + o_ih0);
+            const int s_im = khalf ? (im1 + o_im1) : (im0 + o_im0);
+            float dot = 0.0f;
+            if constexpr (SPLIT3) {
+                const int o_il0 = dpp_xor1_i32(il0), o_il1 = dpp_xor1_i32(il1);
+                const int s_il = khalf ? (il1 + o_il1) : (il0 + o_il0);
+                dot = join3_s8_906(s_ih, s_im, s_il);
+            } else {
+                dot = join2_s8_906(s_ih, s_im);
+            }
+            S.part[wave][my_h][c_ld] = dot * (S.qinv[wave][my_h] * ksc);
+        }
+        __syncthreads();
+
+        // Online base-2 softmax across the 4 dim-group partials (8 lanes per head row, 4 cells per lane).
+        if (t < G * 8) {
+            const int r = t >> 3, sub = t & 7;
+            float x[4], mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = sub * 4 + j;
+                x[j] = S.valid[c] ? (((S.part[0][r][c] + S.part[1][r][c]) + S.part[2][r][c]) + S.part[3][r][c]) * scale_log2
+                                  : -INFINITY;
+                mx = fmaxf(mx, x[j]);
+            }
+            mx = fmaxf(mx, dpp_xor1_f32(mx));
+            mx = fmaxf(mx, dpp_xor2_f32(mx));
+            mx = fmaxf(mx, __shfl_xor(mx, 4, 64));
+            const float m_old = S.mrow[r];
+            const float m_new = fmaxf(m_old, mx);
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float e = x[j] == -INFINITY ? 0.0f : exp2f(x[j] - m_new);
+                S.p[r][sub * 4 + j] = e;
+                sum += e;
+            }
+            sum += dpp_xor1_f32(sum);
+            sum += dpp_xor2_f32(sum);
+            sum += __shfl_xor(sum, 4, 64);
+            if (sub == 0) {
+                const float a = m_old == -INFINITY ? 0.0f : exp2f(m_old - m_new);
+                S.alpha[r] = a;
+                S.lsum[r] = fmaf(S.lsum[r], a, sum);
+                S.mrow[r] = m_new;
+            }
+        }
+        __syncthreads();
+
+        // P.V over this wave's 64 dims: per-(wave, vsub, head) scale preserves full 24-bit precision even when chunk p << 1.
+        {
+            const int c32 = lane & 31, hh = lane >> 5, pk32 = c32 >> 2;
+#pragma unroll
+            for (int vsi = 0; vsi < VS_SUB; ++vsi) {
+                const float vs_c = S.vs[wave][vsi][c32];
+#pragma unroll
+                for (int h0 = 0; h0 < G; h0 += 2) {
+                    const int h = h0 + hh;
+                    const float pv_raw = S.p[h][c32] * vs_c;
+                    float pmax = fabsf(pv_raw);
+                    pmax = fmaxf(pmax, dpp_xor1_f32(pmax));
+                    pmax = fmaxf(pmax, dpp_xor2_f32(pmax));
+                    pmax = fmaxf(pmax, __shfl_xor(pmax, 4, 64));
+                    pmax = fmaxf(pmax, __shfl_xor(pmax, 8, 64));
+                    pmax = fmaxf(pmax, __shfl_xor(pmax, 16, 64));
+                    const float pup = pmax > 0.0f ? 126.0f / pmax : 0.0f;
+                    if (c32 == 0) S.pinv[wave][vsi][h] = pmax * (1.0f / 126.0f);
+                    int bh = 0, bm = 0, bl = 0;
+                    if constexpr (SPLIT3) split3_s8_906(pv_raw * pup, bh, bm, bl);
+                    else split2_s8_906(pv_raw * pup, bh, bm);
+                    const uint32_t wh = pack4_quad_906(bh);
+                    const uint32_t wm = pack4_quad_906(bm);
+                    uint32_t wl = 0;
+                    if constexpr (SPLIT3) wl = pack4_quad_906(bl);
+                    if ((lane & 3) == 0) {
+                        S.ph[wave][vsi][h][pk32] = wh;
+                        S.pm[wave][vsi][h][pk32] = wm;
+                        if constexpr (SPLIT3) S.pl[wave][vsi][h][pk32] = wl;
+                    }
+                }
+            }
+        }
+        strata_syncwarp();
+
+        {
+            const int vsi = KV_MODE == 3 ? (lane >> 5) : 0;
+            int ih[G] = {}, im[G] = {}, il[G] = {};
+#pragma unroll
+            for (int pk0 = 0; pk0 < WCH / 4; pk0 += 4) {
+                int vb[4];
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const int pk = pk0 + u;
+                    const uint32_t w0 = S.vraw[wave][4 * pk + 0][dw_pv];
+                    const uint32_t w1 = S.vraw[wave][4 * pk + 1][dw_pv];
+                    const uint32_t w2 = S.vraw[wave][4 * pk + 2][dw_pv];
+                    const uint32_t w3 = S.vraw[wave][4 * pk + 3][dw_pv];
+                    const uint32_t t01 = __byte_perm(w0, w1, sel01);
+                    const uint32_t t23 = __byte_perm(w2, w3, sel01);
+                    vb[u] = (int) __byte_perm(t01, t23, 0x5410u);
+                }
+                const int half4 = pk0 >> 2;
+#pragma unroll
+                for (int h = 0; h < G; ++h) {
+                    const uint4 ph4 = reinterpret_cast<const uint4*>(S.ph[wave][vsi][h])[half4];
+                    const uint4 pm4 = reinterpret_cast<const uint4*>(S.pm[wave][vsi][h])[half4];
+                    ih[h] = strata_dp4a((int) ph4.x, vb[0], ih[h]);
+                    ih[h] = strata_dp4a((int) ph4.y, vb[1], ih[h]);
+                    ih[h] = strata_dp4a((int) ph4.z, vb[2], ih[h]);
+                    ih[h] = strata_dp4a((int) ph4.w, vb[3], ih[h]);
+                    im[h] = strata_dp4a((int) pm4.x, vb[0], im[h]);
+                    im[h] = strata_dp4a((int) pm4.y, vb[1], im[h]);
+                    im[h] = strata_dp4a((int) pm4.z, vb[2], im[h]);
+                    im[h] = strata_dp4a((int) pm4.w, vb[3], im[h]);
+                    if constexpr (SPLIT3) {
+                        const uint4 pl4 = reinterpret_cast<const uint4*>(S.pl[wave][vsi][h])[half4];
+                        il[h] = strata_dp4a((int) pl4.x, vb[0], il[h]);
+                        il[h] = strata_dp4a((int) pl4.y, vb[1], il[h]);
+                        il[h] = strata_dp4a((int) pl4.z, vb[2], il[h]);
+                        il[h] = strata_dp4a((int) pl4.w, vb[3], il[h]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+                const float tmp = SPLIT3 ? join3_s8_906(ih[h], im[h], il[h]) : join2_s8_906(ih[h], im[h]);
+                acc[h] = fmaf(acc[h], S.alpha[h], tmp * S.pinv[wave][vsi][h]);
+            }
+        }
+        strata_syncwarp();
+    }
+
+    // Epilogue: normalize and write contiguous 64-dim slices (or fused sigmoid gate -> FP16).
+    const int d = dim0 + lane;
+#pragma unroll
+    for (int h = 0; h < G; ++h) {
+        const float l = S.lsum[h];
+        const float a = l > 0.0f ? acc[h] * (1.0f / l) : 0.0f;
+        if constexpr (GATE) {
+            const int gh = kvh * G + h;
+            const float gval = qf[(size_t) qi * n_head * 2 * HD + (size_t) gh * 2 * HD + HD + d];
+            o16[(size_t) qi * ld16 + (size_t) gh * HD + d] =
+                __half_as_ushort(__float2half_rn(a * (1.0f / (1.0f + expf(-gval)))));
+        } else {
+            attn[(size_t) h * HD + d] = a;
+        }
+    }
+}
+
+std::atomic<bool> g_gfx906_pa_failed{false};
+
+bool gfx906_pa_usable() {
+    if (g_gfx906_pa_failed.load(std::memory_order_relaxed)) return false;
+    static const int mode = [] {
+        if (const char* e = std::getenv("STRATA_GFX906_PA"); e != nullptr && e[0] != '\0')
+            return e[0] == '0' ? 0 : 1;
+        if (const char* w = std::getenv("STRATA_HIP_WMMA"); w != nullptr && w[0] != '\0')
+            return w[0] == '1' ? 1 : 0;
+        return 0;
+    }();
+    if (mode <= 0) return false;
+    static int arch_ok[64] = {};
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) { (void) hipGetLastError(); return false; }
+    if (arch_ok[dev] == 0) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, dev) != hipSuccess) { (void) hipGetLastError(); return false; }
+        arch_ok[dev] = strata::kernels::gfx_arch_is_gfx906(prop.gcnArchName) ? 1 : 2;
+        static bool told = false;
+        if (!told && arch_ok[dev] == 1) {
+            told = true;
+            const char* fast = std::getenv("STRATA_PA_FAST");
+            std::fprintf(stderr, "strata: STRATA_GFX906_PA: Wave64 sdot4 prompt attention on (%s, %s)\n",
+                         prop.gcnArchName, (fast && fast[0] == '1') ? "16-bit fast" : "24-bit exact");
+        }
+    }
+    return arch_ok[dev] == 1;
+}
+
+template <int KV_MODE>
+bool launch_gfx906_pa(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
+                      const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st, const float* gate_qf = nullptr,
+                      uint16_t* gate_o16 = nullptr, int64_t gate_ld = 0) {
+    static const bool fast = [] { const char* e = std::getenv("STRATA_PA_FAST"); return e != nullptr && e[0] == '1'; }();
+    const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
+    for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
+        const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
+        const dim3 grid((unsigned) nb, (unsigned) s.n_head_kv);
+        const float* qq = q + q0 * s.n_head * HD;
+        const int32_t* idq = ids + q0 * cap;
+        const int32_t* stq = steps + q0 * kStepCount;
+        if constexpr (KV_MODE == 1) {
+            if (gate_qf != nullptr) {
+                const float* qfq = gate_qf + (size_t) q0 * s.n_head * 2 * HD;
+                uint16_t* o16q = gate_o16 + (size_t) q0 * gate_ld;
+                if (fast)
+                    prompt_attn_gfx906_kernel<1, false, true><<<grid, THREADS_906, 0, st>>>(
+                        qq, pools, idq, stq, (int) s.n_head_kv, (int) s.page_size, scale_log2, nullptr, (int) cap, qfq, o16q, gate_ld);
+                else
+                    prompt_attn_gfx906_kernel<1, true, true><<<grid, THREADS_906, 0, st>>>(
+                        qq, pools, idq, stq, (int) s.n_head_kv, (int) s.page_size, scale_log2, nullptr, (int) cap, qfq, o16q, gate_ld);
+                continue;
+            }
+        }
+        if (fast)
+            prompt_attn_gfx906_kernel<KV_MODE, false, false><<<grid, THREADS_906, 0, st>>>(
+                qq, pools, idq, stq, (int) s.n_head_kv, (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
+        else
+            prompt_attn_gfx906_kernel<KV_MODE, true, false><<<grid, THREADS_906, 0, st>>>(
+                qq, pools, idq, stq, (int) s.n_head_kv, (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_prompt_attn_batch (gfx906): %s; the FP32 prompt attention runs from here on\n", cudaGetErrorString(e));
+        g_gfx906_pa_failed.store(true);
+        return false;
+    }
+    return true;
+}
+#endif  // STRATA_HIP_GFX906
 #endif
 
 int g_pa_imma = -1;   // STRATA_PROMPT_ATTN_IMMA: -1 not read yet; qsa_prompt_attn_set_imma (tests) overrides it
@@ -2456,7 +2915,13 @@ bool qsa_hip_wmma_active() { return qsa_prompt_attn_matrix_cores_requested(); }
 bool qsa_prompt_attn_batch_gated(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                                  int64_t cap, const QsaShapes& s, const float* qf, uint16_t* o16, int64_t ld16, int64_t n_q,
                                  void* stream) {
-#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+#if defined(__HIPCC__) && defined(STRATA_HIP_GFX906)
+    if (n_q <= 0 || qf == nullptr || o16 == nullptr || ld16 < s.n_head * HD) return false;
+    if (pools.k_q != nullptr && pools.v_q != nullptr && pools.k_scale != nullptr && pools.v_scale != nullptr &&
+        pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
+        cap > 0 && ids && steps && pools.page_table && gfx906_pa_usable())
+        return launch_gfx906_pa<1>(q, pools, ids, steps, cap, s, nullptr, n_q, (cudaStream_t) stream, qf, o16, ld16);
+#elif defined(__HIPCC__)
     if (n_q <= 0 || qf == nullptr || o16 == nullptr || ld16 < s.n_head * HD) return false;
     if (pools.k_q != nullptr && pools.v_q != nullptr && pools.k_scale != nullptr && pools.v_scale != nullptr &&
         pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
@@ -2471,14 +2936,22 @@ bool qsa_prompt_attn_batch_gated(const float* q, const QsaAttnPools& pools, cons
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
     if (n_q <= 0) return true;
+#if defined(__HIPCC__) && defined(STRATA_HIP_GFX906)
+    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table || !gfx906_pa_usable())
+        return false;
+    if (pools.k_q != nullptr && pools.k_q4 == nullptr && pools.k_scale != nullptr) {
+        if (pools.v_q4 != nullptr)
+            return launch_gfx906_pa<3>(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
+        if (pools.v_q != nullptr && pools.v_scale != nullptr)
+            return launch_gfx906_pa<1>(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
+    }
+    return false;
+#endif
     bool volta = false, turing = false, t75 = false;   // per call, from the CURRENT device (a layer split can mix Turing with newer cards)
     {   // sm_75 or newer: the MMA above compiles for both.  sm_80+ runs the cp.async kernel (launch_i8); Turing has
         // no cp.async, so it runs the v1 kernel (launch<1>, same accuracy, another summation order).  An older card
         // keeps the old kernel.
         // #371: the compute capability with its minor - sm_70 (V100) has no m16n8k8 (the kernels trap below sm_75)
-#if defined(STRATA_HIP_GFX906)
-        return false;   // gfx906: the tensor-core and WMMA kernels are not for it; the FP32 kernel runs
-#endif
         static int cc[64] = {};
         int dev = 0;
         if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }

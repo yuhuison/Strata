@@ -3823,8 +3823,8 @@ int main(int argc, char** argv) {
         if (o.ram_keep > 0 && !(hv != nullptr && std::atof(hv) >= 0.0) && o.resident_headroom < o.ram_keep)
             o.resident_headroom = o.ram_keep;
     }
-#if defined(STRATA_USE_HIP)
-    {   // gfx1151 (Strix Halo): the switches that are exact there are on by default (strata/core/arch_defaults.hpp); before
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+    {   // gfx1151 / gfx12 / gfx906: the switches that are exact there are on by default (strata/core/arch_defaults.hpp); before
         // any engine code reads its switches (they are read at first use), and the user's own settings are kept
         cudaDeviceProp ad{};
         if (cudaGetDeviceProperties(&ad, 0) == cudaSuccess) {
